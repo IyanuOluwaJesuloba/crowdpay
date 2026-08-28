@@ -207,7 +207,7 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
     'SELECT wallet_public_key FROM users WHERE id = $1',
     [req.user.userId]
   );
-  const creatorPublicKey = creatorRows[0].wallet_public_key;
+  const creatorPublicKey = creatorRows[0]?.wallet_public_key || null;
 
   const multisig = await getAccountMultisigConfig(campaign.wallet_public_key);
   if (
@@ -227,7 +227,7 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
      WHERE campaign_id = $1 AND refunded = FALSE`,
     [campaign_id]
   );
-  const collectedFees = Number(feeRows[0].total_fees) || 0;
+  const collectedFees = Number(feeRows?.[0]?.total_fees) || 0;
 
   // Referral commissions are settled out of the campaign balance in the same
   // transaction as the creator payout (#675).
@@ -256,6 +256,10 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
     asset: campaign.asset_type,
     collectedFees,
     creatorPublicKey,
+    commissions: payableCommissions.map((commission) => ({
+      destinationPublicKey: commission.destination_public_key,
+      amount: commission.commission_owed,
+    })),
   });
 
   const client = await db.connect();
@@ -577,7 +581,7 @@ const platformApproveHandler = async (req, res) => {
        WHERE campaign_id = $1 AND refunded = FALSE`,
       [updatedWithdrawalRow.campaign_id]
     );
-    const collectedFees = Number(feeRows[0].total_fees) || 0;
+    const collectedFees = Number(feeRows?.[0]?.total_fees) || 0;
 
     if (collectedFees > 0) {
       const creatorShare = await calculateCreatorShare(collectedFees);
@@ -631,7 +635,7 @@ const platformApproveHandler = async (req, res) => {
     );
     await settleCommissions(
       finalizeClient,
-      withdrawalTxRows[0]?.metadata?.referral_commissions || []
+      withdrawalTxRows?.[0]?.metadata?.referral_commissions || []
     );
 
     await finalizeWithdrawalSubmitted(finalizeClient, {
