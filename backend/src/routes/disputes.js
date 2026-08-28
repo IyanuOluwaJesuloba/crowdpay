@@ -239,7 +239,8 @@ router.post('/disputes/:id/evidence', requireAuth, asyncHandler(async (req, res)
   }
   const urls = Array.isArray(attachmentUrls) ? attachmentUrls : [];
   for (const url of urls) {
-    if (!isValidEvidenceUrl(url)) {
+    const { safe } = validateRenderUrl(url);
+    if (!safe) {
       return res.status(422).json({ error: `attachmentUrls contains an invalid URL: ${url}` });
     }
   }
