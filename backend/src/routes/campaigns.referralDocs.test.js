@@ -16,7 +16,7 @@ const spec = swaggerJsdoc({
       },
     },
   },
-  apis: [path.join(__dirname, '*.js')],
+  apis: [path.join(__dirname, '*.js').replace(/\\/g, '/')],
 });
 
 test('the campaign referral endpoints are documented in the OpenAPI spec', () => {

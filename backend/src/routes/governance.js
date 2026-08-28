@@ -14,7 +14,7 @@ const {
   getFeeRegistryInfo,
   invalidateFeeCache,
 } = require('../services/feeRegistry');
-const { authenticateToken } = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
 const { body, param, validationResult } = require('express-validator');
 const logger = require('../config/logger');
 
@@ -64,7 +64,7 @@ router.get('/proposals/:id',
  * User votes on a proposal
  */
 router.post('/proposals/:id/vote',
-  authenticateToken,
+  requireAuth,
   param('id').isUUID(),
   body('in_favor').isBoolean(),
   body('signer_secret').isString(),
@@ -106,7 +106,7 @@ router.post('/proposals/:id/vote',
  * Create a new proposal (gated by token balance check)
  */
 router.post('/proposals',
-  authenticateToken,
+  requireAuth,
   body('new_fee_bps').isInt({ min: 0, max: 10000 }),
   body('new_creator_share_bps').isInt({ min: 0, max: 10000 }),
   body('rationale_text').isString().isLength({ min: 10, max: 1000 }),
@@ -155,7 +155,7 @@ router.post('/proposals',
  * Execute a proposal (after deadline)
  */
 router.post('/proposals/:id/execute',
-  authenticateToken,
+  requireAuth,
   param('id').isUUID(),
   body('signer_secret').isString(),
   async (req, res, next) => {
@@ -205,7 +205,7 @@ router.get('/fee', async (req, res, next) => {
  * GET /api/governance/user/token-balance
  * Get current user's governance token balance
  */
-router.get('/user/token-balance', authenticateToken, async (req, res, next) => {
+router.get('/user/token-balance', requireAuth, async (req, res, next) => {
   try {
     const publicKey = req.user.wallet_public_key;
     const balance = await getUserTokenBalance(publicKey);

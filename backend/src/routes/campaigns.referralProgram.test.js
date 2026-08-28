@@ -78,6 +78,7 @@ function buildApp({ queryImpl = async () => ({ rows: [] }), referralStub = {}, a
         next();
       },
       requireRole: () => (_req, _res, next) => next(),
+      optionalAuth: (_req, _res, next) => next(),
     },
   });
 

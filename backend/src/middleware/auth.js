@@ -347,6 +347,7 @@ module.exports = {
   ACCESS_TOKEN_COOKIE_NAME,
   IMPERSONATION_TOKEN_COOKIE_NAME,
   requireAuth,
+  authenticateToken: requireAuth,
   optionalAuth,
   authenticate,
   assertApiKeyScopes,
