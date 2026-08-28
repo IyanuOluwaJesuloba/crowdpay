@@ -15,6 +15,7 @@
   "dependencies": {
     "@sentry/react": "^10.55.0",
     "@stellar/freighter-api": "^4.1.0",
+    "crowdpay": "file:..",
     "dompurify": "^3.4.11",
     "easymde": "^2.18.0",
     "firebase": "^11.0.0",
