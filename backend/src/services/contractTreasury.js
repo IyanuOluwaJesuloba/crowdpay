@@ -4,6 +4,7 @@ const { nativeToScVal, Address, Keypair } = require('@stellar/stellar-sdk');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const soroban = require('./sorobanService');
+const { withDecryptedWalletSecret } = require('./walletSecrets');
 
 /**
  * Compiled campaign_treasury WASM. Built from contracts/soroban with
@@ -133,6 +134,36 @@ function requireContractMode(campaign) {
     throw fail('This campaign does not use a contract treasury', 409, 'NOT_CONTRACT_WALLET');
   }
   return campaign.contract_id;
+}
+
+/**
+ * Loads the encrypted wallet secret for whichever user must satisfy
+ * `require_auth()` on-chain (the creator for request_withdrawal, the auditor for
+ * approve_withdrawal). The contract checks the caller's own address, so signing
+ * with PLATFORM_SECRET_KEY on their behalf is never valid — only their own key
+ * authorizes their own address.
+ */
+async function loadCustodialSigner(userId, role, missingCode) {
+  const { rows } = await db.query(
+    'SELECT wallet_type, wallet_public_key, wallet_secret_encrypted FROM users WHERE id = $1',
+    [userId]
+  );
+  const user = rows[0];
+  if (!user?.wallet_public_key) {
+    throw fail(`Campaign ${role} has no wallet`, 409, missingCode);
+  }
+  if (user.wallet_type === 'freighter') {
+    throw fail(
+      `Contract-treasury signing requires the ${role}'s server-held wallet key; non-custodial (Freighter) ${role} wallets are not yet supported here`,
+      501,
+      'FREIGHTER_SIGNING_UNSUPPORTED'
+    );
+  }
+  return {
+    userId,
+    walletPublicKey: user.wallet_public_key,
+    walletSecretEncrypted: user.wallet_secret_encrypted,
+  };
 }
 
 /**
@@ -316,15 +347,21 @@ async function indexContribution(campaignId, { contributor, amount, txHash }) {
 async function buildWithdrawalRequest(campaignId, { amount, destination, memo, requestedBy }) {
   const campaign = await loadCampaign(campaignId);
   const contractId = requireContractMode(campaign);
+  const creator = await loadCustodialSigner(campaign.creator_id, 'creator', 'CREATOR_WALLET_MISSING');
 
   let result;
   try {
-    result = await soroban.invokeContract({
-      contractId,
-      method: 'request_withdrawal',
-      args: [i128(amount), addressArg(destination), symbolArg(memo)],
-      signerSecret: process.env.PLATFORM_SECRET_KEY,
-    });
+    result = await withDecryptedWalletSecret(
+      creator.walletSecretEncrypted,
+      { userId: creator.userId, walletPublicKey: creator.walletPublicKey },
+      (creatorSecret) =>
+        soroban.invokeContract({
+          contractId,
+          method: 'request_withdrawal',
+          args: [i128(amount), addressArg(destination), symbolArg(memo)],
+          signerSecret: creatorSecret,
+        })
+    );
   } catch (err) {
     throw translateContractError(err);
   }
@@ -359,17 +396,30 @@ async function buildWithdrawalRequest(campaignId, { amount, destination, memo, r
 }
 
 /** Auditor sign-off; releases a withdrawal the contract parked. */
-async function approvePendingWithdrawal(campaignId, pendingId, { auditorSecret } = {}) {
+async function approvePendingWithdrawal(campaignId, pendingId, { approverId } = {}) {
   const campaign = await loadCampaign(campaignId);
   const contractId = requireContractMode(campaign);
+  if (!approverId) {
+    throw fail('Auditor approval requires the authenticated approver', 400, 'VALIDATION_ERROR');
+  }
+  const auditor = await loadCustodialSigner(approverId, 'auditor', 'AUDITOR_WALLET_MISSING');
+
+  if (campaign.auditor_public_key && auditor.walletPublicKey !== campaign.auditor_public_key) {
+    throw fail('The signer does not match the configured auditor', 403, 'AUDITOR_MISMATCH');
+  }
 
   try {
-    await soroban.invokeContract({
-      contractId,
-      method: 'approve_withdrawal',
-      args: [nativeToScVal(Number(pendingId), { type: 'u32' })],
-      signerSecret: auditorSecret || process.env.PLATFORM_SECRET_KEY,
-    });
+    await withDecryptedWalletSecret(
+      auditor.walletSecretEncrypted,
+      { userId: auditor.userId, walletPublicKey: auditor.walletPublicKey },
+      (auditorSecret) =>
+        soroban.invokeContract({
+          contractId,
+          method: 'approve_withdrawal',
+          args: [nativeToScVal(Number(pendingId), { type: 'u32' })],
+          signerSecret: auditorSecret,
+        })
+    );
   } catch (err) {
     throw translateContractError(err);
   }

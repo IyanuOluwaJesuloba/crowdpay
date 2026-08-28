@@ -300,6 +300,7 @@ app.use("/api", require("./routes/announcement"));
 app.use("/api/creator/analytics", require("./routes/creatorAnalytics"));
 app.use("/api/governance", require("./routes/governance"));
 app.use("/api/embed", require("./routes/embed"));
+app.use("/api/ops", require("./routes/ops"));
 
 app.get("/health", async (_, res) => {
   try {
@@ -581,6 +582,8 @@ async function bootstrap() {
     startBenchmarkRefreshCron();
     startFeeCacheRefreshCron();
     startTrendingCron();
+    const { startHealthCollector } = require("./services/ops/healthCollector");
+    startHealthCollector();
   });
 }
 

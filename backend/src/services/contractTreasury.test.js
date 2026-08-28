@@ -15,6 +15,7 @@ const CAMPAIGN_ID = '11111111-1111-1111-1111-111111111111';
 // Real Stellar keys — Address.fromString validates, so placeholders will not do.
 const DEST = 'GAJZF6DOHVKNA4VYDMGEB4BOBV27VI6O5ERDGJP5TH6JPGIUAUSLNCRS';
 const CREATOR = 'GD3I6UAGVCRIWVC5SVFHIHARP7IXKBGKUL74JTCU64T5LCQKFPYAYCC5';
+const AUDITOR = 'GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI';
 
 function build({ queryImpl = async () => ({ rows: [] }), soroban = {} } = {}) {
   const calls = [];
@@ -36,6 +37,12 @@ function build({ queryImpl = async () => ({ rows: [] }), soroban = {} } = {}) {
     '../config/database': { query: queryImpl },
     '../config/logger': { info() {}, warn() {}, error() {} },
     './sorobanService': sorobanStub,
+    // Real wallet-secret encryption depends on env-configured key material the
+    // tests don't set up; the "encrypted" value stands in for the plaintext so
+    // assertions can check exactly which key reaches signerSecret.
+    './walletSecrets': {
+      withDecryptedWalletSecret: async (secret, _context, fn) => fn(secret),
+    },
   });
 
   return { service, calls };
@@ -52,6 +59,15 @@ function campaignRow(overrides = {}) {
     contract_id: 'CTREASURY',
     auditor_public_key: null,
     status: 'active',
+    ...overrides,
+  };
+}
+
+function userRow(overrides = {}) {
+  return {
+    wallet_type: 'custodial',
+    wallet_public_key: CREATOR,
+    wallet_secret_encrypted: 'creator-secret',
     ...overrides,
   };
 }
@@ -178,6 +194,7 @@ test('a withdrawal under the auditor threshold is recorded as completed immediat
     soroban: { invokeResult: null },
     queryImpl: async (text, params) => {
       if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM users')) return { rows: [userRow()] };
       if (text.includes('INSERT INTO withdrawal_requests')) {
         inserted = params;
         return { rows: [{ id: 'w-1', status: 'completed', contract_pending_id: null }] };
@@ -198,6 +215,10 @@ test('a withdrawal under the auditor threshold is recorded as completed immediat
   assert.equal(inserted[5], 'completed');
   assert.ok(inserted[7] instanceof Date, 'completed_at should be stamped');
   assert.equal(calls[0].method, 'request_withdrawal');
+  // request_withdrawal requires Soroban `creator.require_auth()`; signing with the
+  // platform key (or anyone else's) would fail on-chain, so the invocation must
+  // carry the creator's own key, not the platform's.
+  assert.equal(calls[0].signerSecret, 'creator-secret');
 });
 
 test('a withdrawal above the auditor threshold is parked as pending_auditor', async () => {
@@ -206,6 +227,7 @@ test('a withdrawal above the auditor threshold is parked as pending_auditor', as
     soroban: { invokeResult: 7 },
     queryImpl: async (text, params) => {
       if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM users')) return { rows: [userRow()] };
       if (text.includes('INSERT INTO withdrawal_requests')) {
         inserted = params;
         return { rows: [{ id: 'w-2', status: 'pending_auditor', contract_pending_id: 7 }] };
@@ -229,6 +251,57 @@ test('a withdrawal above the auditor threshold is parked as pending_auditor', as
   assert.equal(inserted[7], null);
 });
 
+test('the creator and platform accounts are distinct: requesting with only a platform key configured still signs as the creator', async () => {
+  const { service, calls } = build({
+    soroban: { invokeResult: null },
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_public_key: CREATOR, wallet_secret_encrypted: 'creator-secret' })] };
+      }
+      if (text.includes('INSERT INTO withdrawal_requests')) {
+        return { rows: [{ id: 'w-1', status: 'completed', contract_pending_id: null }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await service.buildWithdrawalRequest(CAMPAIGN_ID, {
+    amount: '100',
+    destination: DEST,
+    memo: 'payout',
+    requestedBy: 'creator-1',
+  });
+
+  // The old bug always signed with PLATFORM_SECRET_KEY, which never satisfies
+  // `creator.require_auth()` unless the two keys are accidentally identical.
+  assert.equal(calls[0].signerSecret, 'creator-secret');
+  assert.notEqual(calls[0].signerSecret, process.env.PLATFORM_SECRET_KEY);
+});
+
+test('a creator without a custodial wallet cannot request a contract withdrawal from the server', async () => {
+  const { service } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_type: 'freighter', wallet_secret_encrypted: null })] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      service.buildWithdrawalRequest(CAMPAIGN_ID, {
+        amount: '100',
+        destination: DEST,
+        memo: 'payout',
+        requestedBy: 'creator-1',
+      }),
+    (err) => err.code === 'FREIGHTER_SIGNING_UNSUPPORTED' && err.statusCode === 501
+  );
+});
+
 test('a policy violation surfaces as its contract code and writes no row', async () => {
   let insertAttempted = false;
   const { service } = build({
@@ -241,6 +314,7 @@ test('a policy violation surfaces as its contract code and writes no row', async
     },
     queryImpl: async (text) => {
       if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM users')) return { rows: [userRow()] };
       if (text.includes('INSERT INTO withdrawal_requests')) insertAttempted = true;
       return { rows: [] };
     },
@@ -281,7 +355,12 @@ test('approving a pending withdrawal completes exactly that row', async () => {
   let updateParams;
   const { service, calls } = build({
     queryImpl: async (text, params) => {
-      if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
+      }
       if (text.includes('UPDATE withdrawal_requests')) {
         updateParams = params;
         return { rows: [{ id: 'w-2', status: 'completed', amount: '9000.0000000' }] };
@@ -290,23 +369,108 @@ test('approving a pending withdrawal completes exactly that row', async () => {
     },
   });
 
-  const row = await service.approvePendingWithdrawal(CAMPAIGN_ID, 7);
+  const row = await service.approvePendingWithdrawal(CAMPAIGN_ID, 7, { approverId: 'auditor-1' });
   assert.equal(row.status, 'completed');
   assert.deepEqual(updateParams, [CAMPAIGN_ID, 7]);
   assert.equal(calls[0].method, 'approve_withdrawal');
+  // approve_withdrawal requires Soroban `auditor.require_auth()`; the platform key
+  // signs a different address and must not be substituted for the auditor's own.
+  assert.equal(calls[0].signerSecret, 'auditor-secret');
 });
 
-test('approving an id the database does not hold is a 404', async () => {
-  const { service } = build({
+test('approving without an authenticated approver is rejected before touching the contract', async () => {
+  const { service, calls } = build({
     queryImpl: async (text) => {
       if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
       return { rows: [] };
     },
   });
   await assert.rejects(
-    () => service.approvePendingWithdrawal(CAMPAIGN_ID, 99),
+    () => service.approvePendingWithdrawal(CAMPAIGN_ID, 7),
+    (err) => err.code === 'VALIDATION_ERROR' && err.statusCode === 400
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('approving an id the database does not hold is a 404', async () => {
+  const { service } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
+      }
+      return { rows: [] };
+    },
+  });
+  await assert.rejects(
+    () => service.approvePendingWithdrawal(CAMPAIGN_ID, 99, { approverId: 'auditor-1' }),
     (err) => err.code === 'PENDING_NOT_FOUND' && err.statusCode === 404
   );
+});
+
+test('auditor whose wallet does not match the campaign auditor key is rejected', async () => {
+  const { service, calls } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) {
+        // Campaign expects a different auditor than the one calling.
+        return { rows: [campaignRow({ auditor_public_key: CREATOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await assert.rejects(
+    () => service.approvePendingWithdrawal(CAMPAIGN_ID, 7, { approverId: 'auditor-1' }),
+    (err) => err.code === 'AUDITOR_MISMATCH' && err.statusCode === 403
+  );
+  assert.equal(calls.length, 0, 'must not reach the contract when the auditor mismatches');
+});
+
+test('a Freighter-only auditor cannot approve from the server', async () => {
+  const { service, calls } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_type: 'freighter', wallet_public_key: AUDITOR, wallet_secret_encrypted: null })] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await assert.rejects(
+    () => service.approvePendingWithdrawal(CAMPAIGN_ID, 7, { approverId: 'auditor-1' }),
+    (err) => err.code === 'FREIGHTER_SIGNING_UNSUPPORTED' && err.statusCode === 501
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('the auditor and platform accounts are distinct: approval signs with the auditor key', async () => {
+  const { service, calls } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
+      }
+      if (text.includes('UPDATE withdrawal_requests')) {
+        return { rows: [{ id: 'w-2', status: 'completed', amount: '9000.0000000' }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await service.approvePendingWithdrawal(CAMPAIGN_ID, 7, { approverId: 'auditor-1' });
+  assert.equal(calls[0].signerSecret, 'auditor-secret');
+  assert.notEqual(calls[0].signerSecret, process.env.PLATFORM_SECRET_KEY,
+    'approval must use the auditor key, not the platform key');
 });
 
 // ── live status ──────────────────────────────────────────────────────────────

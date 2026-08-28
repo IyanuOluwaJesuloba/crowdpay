@@ -341,3 +341,91 @@ test('POST /api/milestones/:id/approve prevents concurrent approval via atomic c
   assert.equal(res2.status, 409, 'second concurrent approval should be blocked');
   assert.match(res2.body.error, /already being processed|already claimed/i);
 });
+
+test('POST /api/milestones/:id/submit rejects javascript: scheme in evidence_url', async () => {
+  const { app, cleanup } = buildApp({
+    queryImpl: async (text) => {
+      if (text.includes('FROM milestones m') && text.includes('JOIN campaigns')) {
+        return { rows: [milestoneRow()] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const res = await request(app)
+    .post(`/api/milestones/${MILESTONE_ID}/submit`)
+    .send({
+      evidence_url: 'javascript:alert(1)',
+      destination_key: VALID_DESTINATION,
+    });
+
+  cleanup();
+  assert.equal(res.status, 422);
+  assert.match(res.body.error, /evidence_url is not valid/i);
+});
+
+test('POST /api/milestones/:id/submit rejects data: scheme in evidence_url', async () => {
+  const { app, cleanup } = buildApp({
+    queryImpl: async (text) => {
+      if (text.includes('FROM milestones m') && text.includes('JOIN campaigns')) {
+        return { rows: [milestoneRow()] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const res = await request(app)
+    .post(`/api/milestones/${MILESTONE_ID}/submit`)
+    .send({
+      evidence_url: 'data:text/html,<script>alert(1)</script>',
+      destination_key: VALID_DESTINATION,
+    });
+
+  cleanup();
+  assert.equal(res.status, 422);
+  assert.match(res.body.error, /evidence_url is not valid/i);
+});
+
+test('POST /api/milestones/:id/submit rejects malformed URL', async () => {
+  const { app, cleanup } = buildApp({
+    queryImpl: async (text) => {
+      if (text.includes('FROM milestones m') && text.includes('JOIN campaigns')) {
+        return { rows: [milestoneRow()] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const res = await request(app)
+    .post(`/api/milestones/${MILESTONE_ID}/submit`)
+    .send({
+      evidence_url: 'not-a-valid-url',
+      destination_key: VALID_DESTINATION,
+    });
+
+  cleanup();
+  assert.equal(res.status, 422);
+  assert.match(res.body.error, /evidence_url is not valid/i);
+});
+
+test('POST /api/milestones/:id/submit rejects vbscript: scheme', async () => {
+  const { app, cleanup } = buildApp({
+    queryImpl: async (text) => {
+      if (text.includes('FROM milestones m') && text.includes('JOIN campaigns')) {
+        return { rows: [milestoneRow()] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const res = await request(app)
+    .post(`/api/milestones/${MILESTONE_ID}/submit`)
+    .send({
+      evidence_url: 'vbscript:MsgBox("XSS")',
+      destination_key: VALID_DESTINATION,
+    });
+
+  cleanup();
+  assert.equal(res.status, 422);
+  assert.match(res.body.error, /evidence_url is not valid/i);
+});

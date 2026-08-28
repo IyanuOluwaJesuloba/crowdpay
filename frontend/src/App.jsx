@@ -40,6 +40,7 @@ const CreatorCampaignAnalytics = lazy(() => import('./pages/CreatorCampaignAnaly
 const Governance = lazy(() => import('./pages/Governance'));
 const CampaignShare = lazy(() => import('./pages/CampaignShare'));
 const ReferralDashboard = lazy(() => import('./pages/ReferralDashboard'));
+const OpsCenter = lazy(() => import('./pages/OpsCenter'));
 
 function PrivateRoute({ children }) {
   const { user, ready } = useAuth();
@@ -166,6 +167,10 @@ export default function App() {
                 <Route
                   path="/governance"
                   element={<Governance />}
+                />
+                <Route
+                  path="/ops"
+                  element={<OpsCenter />}
                 />
                 <Route
                   path="/my-contributions"

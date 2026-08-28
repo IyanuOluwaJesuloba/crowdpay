@@ -31,6 +31,7 @@ const {
   sendMilestoneEvidenceSubmittedAdminEmail,
 } = require('../services/emailService');
 const asyncHandler = require('../utils/asyncHandler');
+const { validateRenderUrl } = require('../utils/urlValidation');
 
 function frontendBaseUrl() {
   return (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
@@ -341,6 +342,11 @@ router.post('/:id/submit', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'destination_key must be a valid Stellar public key' });
   }
 
+  const { safe: urlSafe, reason: urlReason, normalized: normalizedUrl } = validateRenderUrl(evidenceUrl);
+  if (!urlSafe) {
+    return res.status(422).json({ error: `evidence_url is not valid: ${urlReason}` });
+  }
+
   const { rows: milestones } = await db.query(
     `SELECT m.*, c.creator_id, c.status AS campaign_status, c.title AS campaign_title,
             c.migration_in_progress
@@ -394,8 +400,8 @@ router.post('/:id/submit', requireAuth, async (req, res) => {
            completed_at = NOW()
        WHERE id = $4 AND status IN ('pending', 'rejected')
        RETURNING *`,
-      [
-        String(evidenceUrl).trim(),
+       [
+        normalizedUrl,
         String(evidenceDescription || '').trim() || null,
         destinationKey,
         req.params.id,

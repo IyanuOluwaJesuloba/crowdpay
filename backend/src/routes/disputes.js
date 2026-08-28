@@ -13,18 +13,10 @@ const { parsePagination } = require('../utils/pagination');
 const asyncHandler = require('../utils/asyncHandler');
 const stellarService = require('../services/stellarService');
 const { ERROR_CODES, allocateProportionalRefunds } = require('../services/dispute');
+const { validateRenderUrl } = require('../utils/urlValidation');
 
 function frontendBaseUrl() {
   return (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
-}
-
-function isValidEvidenceUrl(urlString) {
-  try {
-    const u = new URL(urlString);
-    return u.protocol === 'https:' || u.protocol === 'http:';
-  } catch {
-    return false;
-  }
 }
 
 async function logDisputeEvent(client, { disputeId, actorId, action, note }) {
@@ -46,8 +38,11 @@ router.post('/campaigns/:id/disputes', requireAuth, async (req, res) => {
   if (!description || !description.trim()) {
     return res.status(422).json({ error: 'description is required' });
   }
-  if (evidence_url !== undefined && evidence_url !== null && evidence_url !== '' && !isValidEvidenceUrl(evidence_url)) {
-    return res.status(422).json({ error: 'evidence_url must be a valid http(s) URL' });
+  if (evidence_url !== undefined && evidence_url !== null && evidence_url !== '') {
+    const { safe } = validateRenderUrl(evidence_url);
+    if (!safe) {
+      return res.status(422).json({ error: 'evidence_url must be a valid http(s) URL' });
+    }
   }
 
   const { rows: campaigns } = await db.query(

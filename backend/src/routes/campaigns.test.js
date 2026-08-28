@@ -765,7 +765,7 @@ test('Analytics routes enforce requireAuth and requireCampaignMember', async () 
 
 function buildShareApp({ campaignExists = true, initialShareCount = 5, authUser } = {}) {
   let shareCount = initialShareCount;
-  const dedup = new Map(); // `${campaignId}:${actorHash}` -> lastSharedAtMs
+  const dedup = new Map();
   const WINDOW_MS = 60 * 60 * 1000;
 
   const queryImpl = async (text, params) => {
@@ -779,7 +779,7 @@ function buildShareApp({ campaignExists = true, initialShareCount = 5, authUser 
       const last = dedup.get(key);
       const now = Date.now();
       if (last !== undefined && now - last < WINDOW_MS) {
-        return { rows: [] }; // duplicate within window
+        return { rows: [] };
       }
       dedup.set(key, now);
       return { rows: [{ campaign_id: campaignId }] };
@@ -792,7 +792,7 @@ function buildShareApp({ campaignExists = true, initialShareCount = 5, authUser 
   };
 
   const app = buildApp({ queryImpl, authUser });
-  app.set('trust proxy', true); // so X-Forwarded-For actually changes req.ip in these tests
+  app.set('trust proxy', true);
   return app;
 }
 
@@ -813,7 +813,7 @@ test('POST /api/campaigns/:id/share does not recount a repeated share from the s
 
   assert.equal(first.body.share_count, 6);
   assert.equal(second.status, 200);
-  assert.equal(second.body.share_count, 6); // unchanged
+  assert.equal(second.body.share_count, 6);
 });
 
 test('POST /api/campaigns/:id/share counts shares from different actors independently', async () => {
@@ -830,10 +830,10 @@ test('POST /api/campaigns/:id/share dedups an authenticated user by user id, not
   const app = buildShareApp({ initialShareCount: 5, authUser: { userId: 'user-42' } });
 
   const first = await request(app).post('/api/campaigns/c-1/share').set('X-Forwarded-For', '1.2.3.4');
-  const second = await request(app).post('/api/campaigns/c-1/share').set('X-Forwarded-For', '9.9.9.9'); // same user, different IP
+  const second = await request(app).post('/api/campaigns/c-1/share').set('X-Forwarded-For', '9.9.9.9');
 
   assert.equal(first.body.share_count, 6);
-  assert.equal(second.body.share_count, 6); // still deduped by user id
+  assert.equal(second.body.share_count, 6);
 });
 
 test('POST /api/campaigns/:id/share returns 404 for a nonexistent campaign', async () => {
@@ -853,4 +853,56 @@ test('POST /api/campaigns/:id/share only counts one increment out of a concurren
 
   const counts = responses.map((r) => r.body.share_count);
   assert.ok(counts.every((c) => c === 1), `expected all responses to report share_count 1, got ${counts}`);
+});
+
+test('GET /api/campaigns/:id denies hidden campaign to demoted admin with stale JWT', async () => {
+  const jwt = require('jsonwebtoken');
+  const secret = process.env.JWT_SECRET || 'testsecret';
+  const token = jwt.sign(
+    {
+      userId: 'admin-1',
+      is_admin: true,
+      role: 'admin',
+      sub: 'admin-1',
+      iss: 'https://crowdpay.io',
+      aud: 'crowdpay-api',
+    },
+    secret,
+    { expiresIn: '1h' }
+  );
+
+  const queryImpl = async (text, params) => {
+    if (text.includes('SELECT is_admin FROM users WHERE id')) {
+      return { rows: [{ is_admin: false }] };
+    }
+    if (text.includes('FROM campaigns WHERE id')) {
+      return {
+        rows: [{
+          id: 'c-hidden',
+          title: 'Hidden Campaign',
+          is_hidden: true,
+          status: 'active',
+          deleted_at: null,
+          creator_id: 'creator-other',
+          contributor_count: 0,
+        }],
+      };
+    }
+    return { rows: [] };
+  };
+
+  const app = buildApp({
+    authUser: { userId: 'admin-1', role: 'admin' },
+    queryImpl,
+    campaignStatusImpl: {
+      refreshCampaignStatus: async () => ({ failed: null, funded: null }),
+      refreshActiveCampaignStatuses: async () => ({ failed: [], funded: [] }),
+    },
+  });
+
+  const res = await request(app)
+    .get('/api/campaigns/c-hidden')
+    .set('Authorization', `Bearer ${token}`);
+
+  assert.equal(res.status, 404);
 });

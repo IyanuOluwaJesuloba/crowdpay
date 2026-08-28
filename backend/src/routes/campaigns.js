@@ -1086,7 +1086,13 @@ router.get('/:id', asyncHandler(async (req, res) => {
       const jwt = require('jsonwebtoken');
       const payload = jwt.verify(token, process.env.JWT_SECRET);
       if (payload && payload.userId) {
-        if (payload.is_admin) {
+        const { rows: userRows } = await db.query(
+          'SELECT is_admin FROM users WHERE id = $1',
+          [payload.userId]
+        );
+        const currentIsAdmin = userRows[0]?.is_admin === true;
+
+        if (currentIsAdmin) {
           userRole = 'owner';
         } else if (campaign.creator_id === payload.userId) {
           userRole = 'owner';
@@ -1094,7 +1100,7 @@ router.get('/:id', asyncHandler(async (req, res) => {
           userRole = await resolveUserCampaignRole(
             campaign.id,
             payload.userId,
-            payload.role === 'admin'
+            false
           );
         }
       }

@@ -289,11 +289,13 @@ test('POST /treasury/withdrawal is refused for a non-creator', async () => {
 
 test('POST /treasury/withdrawal/:pendingId/approve releases the parked withdrawal', async () => {
   let approvedId;
+  let approverId;
   const app = buildApp({
     queryImpl: ownerQuery(),
     treasuryStub: {
-      approvePendingWithdrawal: async (_campaignId, pendingId) => {
+      approvePendingWithdrawal: async (_campaignId, pendingId, opts) => {
         approvedId = pendingId;
+        approverId = opts?.approverId;
         return { id: 'w-2', status: 'completed' };
       },
     },
@@ -306,6 +308,9 @@ test('POST /treasury/withdrawal/:pendingId/approve releases the parked withdrawa
   assert.equal(res.status, 200);
   assert.equal(res.body.status, 'completed');
   assert.equal(approvedId, 7);
+  // The route must identify who is approving so the service can sign with the
+  // auditor's own key rather than a shared/platform one.
+  assert.equal(approverId, CREATOR_ID);
 });
 
 test('a user who is not the auditor cannot approve', async () => {

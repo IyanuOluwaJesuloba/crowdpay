@@ -1,5 +1,8 @@
 node_modules/
 
+# Test coverage output
+coverage/
+
 # Environment files — never commit real secrets
 .env
 .env.*

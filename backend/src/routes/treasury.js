@@ -165,6 +165,7 @@ router.get(
  *       200: { description: "{ type: immediate | pending_auditor }" }
  *       403: { description: Not the campaign creator }
  *       422: { description: "A policy constraint rejected it: HOLD_PERIOD_NOT_ELAPSED, EXCEEDS_MAX_WITHDRAWAL_PCT, COOLDOWN_NOT_ELAPSED, INSUFFICIENT_BALANCE, TREASURY_PAUSED" }
+ *       501: { description: FREIGHTER_SIGNING_UNSUPPORTED - the creator's wallet is non-custodial and cannot yet sign contract calls server-side }
  */
 router.post(
   '/withdrawal',
@@ -213,6 +214,7 @@ router.post(
  *       403: { description: Not the campaign auditor }
  *       404: { description: PENDING_NOT_FOUND }
  *       409: { description: AUDITOR_NOT_CONFIGURED }
+ *       501: { description: FREIGHTER_SIGNING_UNSUPPORTED - the auditor's wallet is non-custodial and cannot yet sign contract calls server-side }
  */
 router.post(
   '/withdrawal/:pendingId/approve',
@@ -224,7 +226,9 @@ router.post(
       return res.status(400).json({ error: 'Invalid pending id', code: 'VALIDATION_ERROR' });
     }
     try {
-      const withdrawal = await treasury.approvePendingWithdrawal(req.params.id, pendingId);
+      const withdrawal = await treasury.approvePendingWithdrawal(req.params.id, pendingId, {
+        approverId: req.user.userId,
+      });
       return res.json(withdrawal);
     } catch (err) {
       return sendServiceError(res, err);
