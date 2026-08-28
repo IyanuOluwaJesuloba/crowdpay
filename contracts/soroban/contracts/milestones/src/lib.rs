@@ -53,6 +53,14 @@ impl MilestonesContract {
         if env.storage().instance().has(&DataKey::Initialized) {
             panic!("Already initialized");
         }
+        platform.require_auth();
+
+        if creator == platform {
+            panic!("Creator and platform must be distinct");
+        }
+        if milestones.is_empty() {
+            panic!("Milestones cannot be empty");
+        }
 
         let mut total_bps: u32 = 0;
         for m in milestones.iter() {
@@ -141,7 +149,7 @@ impl MilestonesContract {
 
         if release_amount > 0 {
             // Approve the withdrawal in escrow (Milestones contract must be the Admin of Escrow)
-            let _ : () = env.invoke_contract(&escrow_address, &Symbol::new(&env, "approve_withdrawal"), (release_amount,).into_val(&env));
+            let _ : () = env.invoke_contract(&escrow_address, &Symbol::new(&env, "approve_withdrawal"), (creator.clone(), release_amount).into_val(&env));
             
             // Execute the withdrawal
             let _ : () = env.invoke_contract(&escrow_address, &Symbol::new(&env, "execute_withdrawal"), (creator.clone(), release_amount).into_val(&env));

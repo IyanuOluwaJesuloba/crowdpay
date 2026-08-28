@@ -6,6 +6,7 @@ mod test {
     #[test]
     fn test_initialize() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let governance_token = Address::generate(&env);
         
@@ -24,8 +25,27 @@ mod test {
     }
 
     #[test]
+    fn test_initialize_requires_admin_auth() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let governance_token = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            FeeRegistry::initialize(
+                &env,
+                admin,
+                governance_token,
+                250,
+                500,
+            );
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_get_fee() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let governance_token = Address::generate(&env);
         
@@ -37,6 +57,7 @@ mod test {
     #[test]
     fn test_propose_change_success() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let proposer = Address::generate(&env);
         let governance_token = Address::generate(&env);
@@ -62,6 +83,7 @@ mod test {
     #[should_panic(expected = "Already initialized")]
     fn test_double_initialize() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let governance_token = Address::generate(&env);
         
@@ -72,6 +94,7 @@ mod test {
     #[test]
     fn test_admin_set_fee() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let governance_token = Address::generate(&env);
         
@@ -86,6 +109,7 @@ mod test {
     #[test]
     fn test_proposal_counter_increment() {
         let env = Env::default();
+        env.mock_all_auths();
         let admin = Address::generate(&env);
         let proposer = Address::generate(&env);
         let governance_token = Address::generate(&env);
