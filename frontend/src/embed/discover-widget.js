@@ -17,29 +17,29 @@
 (function () {
   'use strict';
 
-  var CDN_ORIGIN = 'https://cdn.crowdpay.com';
+  const CDN_ORIGIN = 'https://cdn.crowdpay.com';
 
-  var thisScript = document.currentScript;
+  const thisScript = document.currentScript;
   if (!thisScript) return;
 
-  var token = thisScript.getAttribute('data-token');
-  var topic = thisScript.getAttribute('data-topic') || '';
-  var asset = thisScript.getAttribute('data-asset') || '';
-  var limit = thisScript.getAttribute('data-limit') || '3';
+  const token = thisScript.getAttribute('data-token');
+  const topic = thisScript.getAttribute('data-topic') || '';
+  const asset = thisScript.getAttribute('data-asset') || '';
+  const limit = thisScript.getAttribute('data-limit') || '3';
 
   if (!token) {
     console.error('[CrowdPay widget] data-token is required');
     return;
   }
 
-  var qs = [
+  const qs = [
     'embedToken=' + encodeURIComponent(token),
     topic && 'topic=' + encodeURIComponent(topic),
     asset && 'asset=' + encodeURIComponent(asset),
     'limit=' + encodeURIComponent(limit),
   ].filter(Boolean).join('&');
 
-  var iframe = document.createElement('iframe');
+  const iframe = document.createElement('iframe');
   iframe.src = CDN_ORIGIN + '/embed/discover-widget.html?' + qs;
   iframe.title = 'CrowdPay campaigns';
   iframe.style.cssText = 'width:100%;border:0;display:block;overflow:hidden;';
@@ -55,12 +55,12 @@
 
     if (event.data.type === 'CROWDPAY_WIDGET_READY') {
       if (event.data.height) iframe.height = String(event.data.height);
-      var readyEvent = new CustomEvent('crowdpay:widget-ready', { detail: event.data });
+      const readyEvent = new CustomEvent('crowdpay:widget-ready', { detail: event.data });
       thisScript.parentNode.dispatchEvent(readyEvent);
     }
 
     if (event.data.type === 'CROWDPAY_CAMPAIGN_CLICKED') {
-      var clickEvent = new CustomEvent('crowdpay:campaign-clicked', {
+      const clickEvent = new CustomEvent('crowdpay:campaign-clicked', {
         detail: { campaignId: event.data.campaignId },
       });
       thisScript.parentNode.dispatchEvent(clickEvent);
