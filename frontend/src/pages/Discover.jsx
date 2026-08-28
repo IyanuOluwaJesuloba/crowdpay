@@ -127,7 +127,7 @@ function PersonalisedFeed() {
 
   if (loading) return <div style={styles.empty}>Finding campaigns for you…</div>;
   if (!campaigns.length) {
-    return <div style={styles.empty}>Fund a few campaigns and we'll start tailoring this feed to you.</div>;
+    return <div style={styles.empty}>Fund a few campaigns and we&apos;ll start tailoring this feed to you.</div>;
   }
 
   return (

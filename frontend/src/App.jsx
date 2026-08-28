@@ -38,6 +38,8 @@ const CreatorProfile = lazy(() => import('./pages/CreatorProfile'));
 const CreatorAnalytics = lazy(() => import('./pages/CreatorAnalytics'));
 const CreatorCampaignAnalytics = lazy(() => import('./pages/CreatorCampaignAnalytics'));
 const Governance = lazy(() => import('./pages/Governance'));
+const CampaignShare = lazy(() => import('./pages/CampaignShare'));
+const ReferralDashboard = lazy(() => import('./pages/ReferralDashboard'));
 
 function PrivateRoute({ children }) {
   const { user, ready } = useAuth();

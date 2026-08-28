@@ -38,6 +38,7 @@ function buildLedgerMonitor(mockQuery, treasuryStub) {
         XLM: { type: 'native' },
         USDC: { type: 'credit_alphanum4', issuer: 'GTRUSTEDUSDCISSUER' },
       },
+    },
     '../config/logger': {
       info: () => {},
       warn: () => {},
