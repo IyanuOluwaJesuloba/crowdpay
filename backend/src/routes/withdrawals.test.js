@@ -3,6 +3,16 @@ const assert = require('node:assert/strict');
 const express = require('express');
 const request = require('supertest');
 const proxyquire = require('proxyquire').noCallThru();
+const {
+  Keypair,
+  TransactionBuilder,
+  Asset,
+  Operation,
+  Networks,
+} = require('@stellar/stellar-sdk');
+const actualStellarService = require('../services/stellarService');
+
+const TESTNET_PASSPHRASE = Networks.TESTNET;
 
 function buildApp({ queryImpl, stellarImpl, referralImpl, userId = 'creator-1', role = 'creator', platformApproverUserId } = {}) {
   const prevApprover = process.env.PLATFORM_APPROVER_USER_ID;
@@ -16,12 +26,36 @@ function buildApp({ queryImpl, stellarImpl, referralImpl, userId = 'creator-1', 
       thresholds: { med_threshold: 2 },
       signers: [{ key: 'GCREATOR', weight: 1 }, { key: 'GPLATFORM', weight: 1 }],
     }),
-    signTransactionXdr: () => 'xdr-signed',
-    signatureCountFromXdr: () => 2,
+    signTransactionXdr: (params) => {
+      if (params && typeof params.xdr === 'string' && params.xdr.startsWith('AAAA')) {
+        return actualStellarService.signTransactionXdr(params);
+      }
+      return 'xdr-signed';
+    },
+    signatureCountFromXdr: (xdr) => {
+      if (typeof xdr === 'string' && xdr.startsWith('AAAA')) {
+        return actualStellarService.signatureCountFromXdr(xdr);
+      }
+      return 2;
+    },
     submitSignedWithdrawal: async () => 'tx-hash',
     // Default: XDR is not expired. Override in specific tests via stellarImpl.
-    isXdrExpired: () => false,
+    isXdrExpired: (xdr) => {
+      if (typeof xdr === 'string' && xdr.startsWith('AAAA')) {
+        return actualStellarService.isXdrExpired(xdr);
+      }
+      return false;
+    },
     PLATFORM_PUBLIC_KEY: 'GPLATFORM',
+    validateSubmittedWithdrawalXdr: (params) => {
+      return actualStellarService.validateSubmittedWithdrawalXdr(params);
+    },
+    validateWithdrawalForPlatformSigning: (params) => {
+      if (params && typeof params.xdr === 'string' && params.xdr.startsWith('AAAA')) {
+        return actualStellarService.validateWithdrawalForPlatformSigning(params);
+      }
+      return true;
+    },
     ...stellarImpl,
   };
 
@@ -864,4 +898,730 @@ test('POST /api/withdrawals/:id/approve/platform settles the commissions it subm
   assert.equal(settled.length, 1);
   assert.equal(settled[0].referral_link_id, 'link-1');
   assert.equal(settled[0].commission_owed, '60.0000000');
+});
+
+function buildTestWithdrawalXdr({
+  campaignKeypair,
+  destinationKeypair,
+  amount = '10.0000000',
+  asset = Asset.native(),
+  operations = null,
+  sequence = '100',
+}) {
+  const account = {
+    accountId: () => campaignKeypair.publicKey(),
+    sequenceNumber: () => sequence,
+    incrementSequenceNumber: () => {},
+  };
+
+  const builder = new TransactionBuilder(account, {
+    fee: '100',
+    networkPassphrase: TESTNET_PASSPHRASE,
+  });
+
+  if (operations) {
+    for (const op of operations) {
+      builder.addOperation(op);
+    }
+  } else {
+    builder.addOperation(
+      Operation.payment({
+        destination: destinationKeypair.publicKey(),
+        asset,
+        amount: String(amount),
+      })
+    );
+  }
+
+  const tx = builder.setTimeout(3600).build();
+  return tx.toXDR();
+}
+
+test('POST /api/withdrawals/:id/approve/creator (Freighter) succeeds when signed_xdr matches server-generated unsigned_xdr', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const unsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+  });
+
+  const tx = TransactionBuilder.fromXDR(unsignedXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const signedXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    userId: 'creator-1',
+    queryImpl: async (text) => {
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: false,
+            platform_signed: false,
+            unsigned_xdr: unsignedXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+          }],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return {
+          rows: [{
+            wallet_secret_encrypted: null,
+            wallet_public_key: creatorKeypair.publicKey(),
+            wallet_type: 'freighter',
+          }],
+        };
+      }
+      if (text.includes('UPDATE withdrawal_requests') && text.includes('creator_signed = TRUE')) {
+        return { rows: [{ id: 'w-1', creator_signed: true, unsigned_xdr: signedXdr }] };
+      }
+      if (text.includes('INSERT INTO withdrawal_approval_events')) return { rows: [] };
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({ signed_xdr: signedXdr });
+
+  cleanup();
+  assert.equal(response.status, 200);
+  assert.equal(response.body.creator_signed, true);
+});
+
+test('POST /api/withdrawals/:id/approve/creator (Freighter) rejects missing signed_xdr with 400', async () => {
+  const { app, cleanup } = buildApp({
+    userId: 'creator-1',
+    queryImpl: async (text) => {
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: false,
+            platform_signed: false,
+            unsigned_xdr: 'xdr-base',
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_status: 'active',
+          }],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return {
+          rows: [{
+            wallet_secret_encrypted: null,
+            wallet_public_key: 'GCREATOR',
+            wallet_type: 'freighter',
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({});
+
+  cleanup();
+  assert.equal(response.status, 400);
+  assert.match(response.body.error, /signed_xdr is required/i);
+});
+
+test('POST /api/withdrawals/:id/approve/creator (Freighter) rejects tampered XDR with modified amount with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const serverUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+  });
+
+  // Tampered transaction requesting 100 XLM instead of 10 XLM
+  const tamperedUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '100.0000000',
+  });
+
+  const tx = TransactionBuilder.fromXDR(tamperedUnsignedXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const tamperedSignedXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    userId: 'creator-1',
+    queryImpl: async (text) => {
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: false,
+            platform_signed: false,
+            unsigned_xdr: serverUnsignedXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+          }],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return {
+          rows: [{
+            wallet_secret_encrypted: null,
+            wallet_public_key: creatorKeypair.publicKey(),
+            wallet_type: 'freighter',
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({ signed_xdr: tamperedSignedXdr });
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /Signed transaction does not match/i);
+});
+
+test('POST /api/withdrawals/:id/approve/creator (Freighter) rejects arbitrary destination with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const approvedDestination = Keypair.random();
+  const attackerDestination = Keypair.random();
+
+  const serverUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair: approvedDestination,
+    amount: '10.0000000',
+  });
+
+  // Tampered transaction targeting arbitrary attacker destination
+  const tamperedUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair: attackerDestination,
+    amount: '10.0000000',
+  });
+
+  const tx = TransactionBuilder.fromXDR(tamperedUnsignedXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const tamperedSignedXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    userId: 'creator-1',
+    queryImpl: async (text) => {
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: false,
+            platform_signed: false,
+            unsigned_xdr: serverUnsignedXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: approvedDestination.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+          }],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return {
+          rows: [{
+            wallet_secret_encrypted: null,
+            wallet_public_key: creatorKeypair.publicKey(),
+            wallet_type: 'freighter',
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({ signed_xdr: tamperedSignedXdr });
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /Signed transaction does not match|destination does not match/i);
+});
+
+test('POST /api/withdrawals/:id/approve/creator (Freighter) rejects arbitrary asset with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const serverUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+    asset: Asset.native(),
+  });
+
+  const usdcAsset = new Asset('USDC', 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5');
+  const tamperedUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+    asset: usdcAsset,
+  });
+
+  const tx = TransactionBuilder.fromXDR(tamperedUnsignedXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const tamperedSignedXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    userId: 'creator-1',
+    queryImpl: async (text) => {
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: false,
+            platform_signed: false,
+            unsigned_xdr: serverUnsignedXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+          }],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return {
+          rows: [{
+            wallet_secret_encrypted: null,
+            wallet_public_key: creatorKeypair.publicKey(),
+            wallet_type: 'freighter',
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({ signed_xdr: tamperedSignedXdr });
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /Signed transaction does not match/i);
+});
+
+test('POST /api/withdrawals/:id/approve/creator (Freighter) rejects invalid signature with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const wrongKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const unsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+  });
+
+  // Signed by someone else, not creator
+  const tx = TransactionBuilder.fromXDR(unsignedXdr, TESTNET_PASSPHRASE);
+  tx.sign(wrongKeypair);
+  const signedXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    userId: 'creator-1',
+    queryImpl: async (text) => {
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: false,
+            platform_signed: false,
+            unsigned_xdr: unsignedXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+          }],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return {
+          rows: [{
+            wallet_secret_encrypted: null,
+            wallet_public_key: creatorKeypair.publicKey(),
+            wallet_type: 'freighter',
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({ signed_xdr: signedXdr });
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /does not include a valid signature by the creator/i);
+});
+
+test('POST /api/withdrawals/:id/approve/creator (Freighter) rejects non-payment operation with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const serverUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+  });
+
+  // Tampered transaction with accountMerge
+  const tamperedUnsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    operations: [
+      Operation.accountMerge({
+        destination: destinationKeypair.publicKey(),
+      }),
+    ],
+  });
+
+  const tx = TransactionBuilder.fromXDR(tamperedUnsignedXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const tamperedSignedXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    userId: 'creator-1',
+    queryImpl: async (text) => {
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: false,
+            platform_signed: false,
+            unsigned_xdr: serverUnsignedXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+          }],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return {
+          rows: [{
+            wallet_secret_encrypted: null,
+            wallet_public_key: creatorKeypair.publicKey(),
+            wallet_type: 'freighter',
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({ signed_xdr: tamperedSignedXdr });
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /Signed transaction does not match|only payment operations are allowed/i);
+});
+
+test('POST /api/withdrawals/:id/approve/platform validates real XDR parameters before platform signing', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const unsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+  });
+
+  const tx = TransactionBuilder.fromXDR(unsignedXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const creatorSignedXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    role: 'admin',
+    queryImpl: async (text) => {
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes("SELECT role, is_admin FROM users WHERE id")) {
+        return { rows: [{ role: 'admin', is_admin: true }] };
+      }
+      if (text.includes('SELECT wr.*, c.status')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: true,
+            platform_signed: false,
+            unsigned_xdr: creatorSignedXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+            requested_by: 'creator-1',
+          }],
+        };
+      }
+      if (text.includes('SELECT wallet_public_key FROM users WHERE id')) {
+        return { rows: [{ wallet_public_key: creatorKeypair.publicKey() }] };
+      }
+      if (text.includes('UPDATE withdrawal_requests') && text.includes("status = 'approved'")) {
+        return { rows: [{ id: 'w-1', status: 'approved' }] };
+      }
+      if (text.includes('UPDATE withdrawal_requests') && text.includes("status = 'submitted'")) {
+        return { rows: [{ id: 'w-1', status: 'submitted', tx_hash: 'tx-hash' }] };
+      }
+      if (text.includes('INSERT INTO withdrawal_approval_events')) return { rows: [] };
+      if (text.includes('UPDATE stellar_transactions')) return { rows: [] };
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/platform')
+    .set('Authorization', 'Bearer token')
+    .send({});
+
+  cleanup();
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, 'submitted');
+});
+
+test('POST /api/withdrawals/:id/approve/platform rejects tampered arbitrary destination in stored XDR with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const approvedDestination = Keypair.random();
+  const attackerDestination = Keypair.random();
+
+  // Attacker-directed XDR stored in DB
+  const attackerXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair: attackerDestination,
+    amount: '10.0000000',
+  });
+
+  const tx = TransactionBuilder.fromXDR(attackerXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const creatorSignedAttackerXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    role: 'admin',
+    queryImpl: async (text) => {
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes("SELECT role, is_admin FROM users WHERE id")) {
+        return { rows: [{ role: 'admin', is_admin: true }] };
+      }
+      if (text.includes('SELECT wr.*, c.status')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: true,
+            platform_signed: false,
+            unsigned_xdr: creatorSignedAttackerXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: approvedDestination.publicKey(), // approved destination is different!
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+            requested_by: 'creator-1',
+          }],
+        };
+      }
+      if (text.includes('SELECT wallet_public_key FROM users WHERE id')) {
+        return { rows: [{ wallet_public_key: creatorKeypair.publicKey() }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/platform')
+    .set('Authorization', 'Bearer token')
+    .send({});
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /destination does not match approved withdrawal destination/i);
+});
+
+test('POST /api/withdrawals/:id/approve/platform rejects stored XDR missing creator signature with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const unsignedXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    amount: '10.0000000',
+  });
+
+  const { app, cleanup } = buildApp({
+    role: 'admin',
+    queryImpl: async (text) => {
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes("SELECT role, is_admin FROM users WHERE id")) {
+        return { rows: [{ role: 'admin', is_admin: true }] };
+      }
+      if (text.includes('SELECT wr.*, c.status')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: true,
+            platform_signed: false,
+            unsigned_xdr: unsignedXdr, // Unsigned!
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+            requested_by: 'creator-1',
+          }],
+        };
+      }
+      if (text.includes('SELECT wallet_public_key FROM users WHERE id')) {
+        return { rows: [{ wallet_public_key: creatorKeypair.publicKey() }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/platform')
+    .set('Authorization', 'Bearer token')
+    .send({});
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /missing a valid creator signature/i);
+});
+
+test('POST /api/withdrawals/:id/approve/platform rejects stored XDR with non-payment operation with 422', async () => {
+  const campaignKeypair = Keypair.random();
+  const creatorKeypair = Keypair.random();
+  const destinationKeypair = Keypair.random();
+
+  const mergeXdr = buildTestWithdrawalXdr({
+    campaignKeypair,
+    destinationKeypair,
+    operations: [
+      Operation.accountMerge({
+        destination: destinationKeypair.publicKey(),
+      }),
+    ],
+  });
+
+  const tx = TransactionBuilder.fromXDR(mergeXdr, TESTNET_PASSPHRASE);
+  tx.sign(creatorKeypair);
+  const creatorSignedMergeXdr = tx.toXDR();
+
+  const { app, cleanup } = buildApp({
+    role: 'admin',
+    queryImpl: async (text) => {
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes("SELECT role, is_admin FROM users WHERE id")) {
+        return { rows: [{ role: 'admin', is_admin: true }] };
+      }
+      if (text.includes('SELECT wr.*, c.status')) {
+        return {
+          rows: [{
+            id: 'w-1',
+            status: 'pending',
+            creator_signed: true,
+            platform_signed: false,
+            unsigned_xdr: creatorSignedMergeXdr,
+            campaign_id: '11111111-1111-1111-1111-111111111111',
+            campaign_wallet_public_key: campaignKeypair.publicKey(),
+            destination_key: destinationKeypair.publicKey(),
+            amount: '10.0000000',
+            asset_type: 'XLM',
+            campaign_status: 'active',
+            requested_by: 'creator-1',
+          }],
+        };
+      }
+      if (text.includes('SELECT wallet_public_key FROM users WHERE id')) {
+        return { rows: [{ wallet_public_key: creatorKeypair.publicKey() }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/platform')
+    .set('Authorization', 'Bearer token')
+    .send({});
+
+  cleanup();
+  assert.equal(response.status, 422);
+  assert.match(response.body.error, /only payment operations are allowed/i);
 });

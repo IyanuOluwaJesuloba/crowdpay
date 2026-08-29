@@ -699,6 +699,219 @@ function isXdrExpired(xdr) {
   }
 }
 
+class WithdrawalValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'WithdrawalValidationError';
+    this.statusCode = 422;
+    this.isValidationError = true;
+  }
+}
+
+function assetMatches(asset, expectedAssetCode) {
+  if (!asset || !expectedAssetCode) return true;
+  if (expectedAssetCode === 'XLM') {
+    return typeof asset.isNative === 'function' ? asset.isNative() : asset.code === 'XLM' || asset.type === 'native';
+  }
+  const code = typeof asset.getCode === 'function' ? asset.getCode() : asset.code;
+  return code === expectedAssetCode;
+}
+
+/**
+ * Validates that submitted signed XDR matches the server-generated unsigned XDR
+ * and complies with all expected parameters (source, destination, asset, amount, sequence, network, operations, creator signature).
+ */
+function validateSubmittedWithdrawalXdr({
+  signedXdr,
+  unsignedXdr,
+  creatorPublicKey,
+  campaignWalletPublicKey,
+  expectedDestination,
+  expectedAsset,
+  expectedAmount,
+}) {
+  if (!signedXdr) {
+    throw new WithdrawalValidationError('signed_xdr is required for freighter users');
+  }
+  if (!unsignedXdr) {
+    throw new WithdrawalValidationError('Server-generated unsigned_xdr is required to verify withdrawal');
+  }
+
+  let signedTx;
+  try {
+    signedTx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
+  } catch (err) {
+    throw new WithdrawalValidationError('Invalid signed_xdr');
+  }
+
+  let unsignedTx;
+  try {
+    unsignedTx = TransactionBuilder.fromXDR(unsignedXdr, networkPassphrase);
+  } catch (err) {
+    throw new WithdrawalValidationError('Invalid server-generated unsigned_xdr');
+  }
+
+  // 1. Compare the signed transaction body/hash to the server-generated unsigned XDR
+  if (signedTx.hash().toString('hex') !== unsignedTx.hash().toString('hex')) {
+    throw new WithdrawalValidationError('Signed transaction does not match the server-generated withdrawal transaction');
+  }
+
+  // 2. Validate source
+  if (signedTx.source !== unsignedTx.source) {
+    throw new WithdrawalValidationError('Signed transaction source does not match unsigned transaction');
+  }
+  if (campaignWalletPublicKey && signedTx.source !== campaignWalletPublicKey) {
+    throw new WithdrawalValidationError('Transaction source account does not match campaign wallet');
+  }
+
+  // 3. Validate sequence
+  if (String(signedTx.sequence) !== String(unsignedTx.sequence)) {
+    throw new WithdrawalValidationError('Signed transaction sequence does not match unsigned transaction');
+  }
+
+  // 4. Validate operations
+  if (!signedTx.operations || signedTx.operations.length === 0) {
+    throw new WithdrawalValidationError('Transaction contains no operations');
+  }
+
+  for (const op of signedTx.operations) {
+    if (op.type !== 'payment') {
+      throw new WithdrawalValidationError(`Invalid operation type "${op.type}": only payment operations are allowed`);
+    }
+    if (expectedAsset && !assetMatches(op.asset, expectedAsset)) {
+      throw new WithdrawalValidationError('Transaction operation asset does not match campaign asset');
+    }
+  }
+
+  // Validate destination of primary payout
+  if (expectedDestination && signedTx.operations[0].destination !== expectedDestination) {
+    throw new WithdrawalValidationError('Transaction destination does not match approved withdrawal destination');
+  }
+
+  // Validate amounts
+  const firstAmount = parseFloat(signedTx.operations[0].amount);
+  if (isNaN(firstAmount) || firstAmount <= 0) {
+    throw new WithdrawalValidationError('Transaction payment amount must be greater than 0');
+  }
+
+  const totalAmount = signedTx.operations.reduce((sum, op) => sum + parseFloat(op.amount), 0);
+  if (expectedAmount && parseFloat(totalAmount.toFixed(7)) > parseFloat(expectedAmount)) {
+    throw new WithdrawalValidationError('Transaction total amount exceeds approved withdrawal amount');
+  }
+
+  // 5. Validate creator signature
+  if (!signedTx.signatures || signedTx.signatures.length === 0) {
+    throw new WithdrawalValidationError('Signed transaction does not include any signatures');
+  }
+
+  if (creatorPublicKey) {
+    let signer;
+    try {
+      signer = Keypair.fromPublicKey(creatorPublicKey);
+    } catch (err) {
+      throw new WithdrawalValidationError('Invalid creator public key');
+    }
+    const signatureValid = signedTx.signatures.some((decorated) => {
+      try {
+        return signer.verify(signedTx.hash(), decorated.signature());
+      } catch (_err) {
+        return false;
+      }
+    });
+    if (!signatureValid) {
+      throw new WithdrawalValidationError('Signed transaction does not include a valid signature by the creator');
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Validates a withdrawal transaction before platform signs it.
+ * Validates source, destination, asset, amount, sequence, network, operation set, and creator signature.
+ */
+function validateWithdrawalForPlatformSigning({
+  xdr,
+  creatorPublicKey,
+  campaignWalletPublicKey,
+  expectedDestination,
+  expectedAsset,
+  expectedAmount,
+}) {
+  if (!xdr) {
+    throw new WithdrawalValidationError('Withdrawal transaction XDR is required');
+  }
+
+  let tx;
+  try {
+    tx = TransactionBuilder.fromXDR(xdr, networkPassphrase);
+  } catch (err) {
+    throw new WithdrawalValidationError('Invalid withdrawal transaction XDR');
+  }
+
+  // Validate source
+  if (campaignWalletPublicKey && tx.source !== campaignWalletPublicKey) {
+    throw new WithdrawalValidationError('Transaction source account does not match campaign wallet');
+  }
+
+  // Validate sequence
+  if (!tx.sequence) {
+    throw new WithdrawalValidationError('Transaction sequence number is missing');
+  }
+
+  // Validate operations
+  if (!tx.operations || tx.operations.length === 0) {
+    throw new WithdrawalValidationError('Transaction contains no operations');
+  }
+
+  for (const op of tx.operations) {
+    if (op.type !== 'payment') {
+      throw new WithdrawalValidationError(`Invalid operation type "${op.type}": only payment operations are allowed`);
+    }
+    if (expectedAsset && !assetMatches(op.asset, expectedAsset)) {
+      throw new WithdrawalValidationError('Transaction operation asset does not match campaign asset');
+    }
+  }
+
+  // Validate primary destination
+  if (expectedDestination && tx.operations[0].destination !== expectedDestination) {
+    throw new WithdrawalValidationError('Transaction destination does not match approved withdrawal destination');
+  }
+
+  // Validate amounts
+  const firstAmount = parseFloat(tx.operations[0].amount);
+  if (isNaN(firstAmount) || firstAmount <= 0) {
+    throw new WithdrawalValidationError('Transaction payment amount must be greater than 0');
+  }
+
+  const totalAmount = tx.operations.reduce((sum, op) => sum + parseFloat(op.amount), 0);
+  if (expectedAmount && parseFloat(totalAmount.toFixed(7)) > parseFloat(expectedAmount)) {
+    throw new WithdrawalValidationError('Transaction total amount exceeds approved withdrawal amount');
+  }
+
+  // Validate creator signature
+  if (creatorPublicKey) {
+    let signer;
+    try {
+      signer = Keypair.fromPublicKey(creatorPublicKey);
+    } catch (err) {
+      throw new WithdrawalValidationError('Invalid creator public key');
+    }
+    const signatureValid = tx.signatures && tx.signatures.some((decorated) => {
+      try {
+        return signer.verify(tx.hash(), decorated.signature());
+      } catch (_err) {
+        return false;
+      }
+    });
+    if (!signatureValid) {
+      throw new WithdrawalValidationError('Transaction is missing a valid creator signature');
+    }
+  }
+
+  return true;
+}
+
 async function submitPreparedTransaction(xdr) {
   const tx = TransactionBuilder.fromXDR(xdr, networkPassphrase);
   const result = await server.submitTransaction(tx);
@@ -1139,4 +1352,7 @@ module.exports = {
   submitDisputeRefund,
   buildBatchRefundTransaction,
   ARBITRATOR_PUBLIC_KEY: ARBITRATOR_KEYPAIR.publicKey(),
+  validateSubmittedWithdrawalXdr,
+  validateWithdrawalForPlatformSigning,
+  WithdrawalValidationError,
 };
