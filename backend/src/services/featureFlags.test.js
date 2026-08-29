@@ -258,6 +258,43 @@ test('syncFlagsToAdapter calls register on adapter for every flag', () => {
   assert.equal(registered[0].def.description, ff.FLAGS[registered[0].name].description);
 });
 
+// ─── External Adapter Implementations ────────────────────────────────
+
+// Configuration documentation for external feature flag providers:
+// - Unleash: set FEATURE_FLAG_PROVIDER=unleash, UNLEASH_URL, UNLEASH_API_TOKEN,
+//   and optionally UNLEASH_ENVIRONMENT.
+// - LaunchDarkly: set FEATURE_FLAG_PROVIDER=launchdarkly and LAUNCHDARKLY_SDK_KEY.
+
+test('Unleash adapter registers CrowdPay flags and maps enabled state', () => {
+  const ff = freshFlags();
+  const registered = new Map();
+  const unleashAdapter = {
+    register(name, def) {
+      registered.set(name, def);
+    },
+    isEnabled(name, context) {
+      // Simulate an Unleash toggle keyed by feature name.
+      return name === 'serve-frontend' && context?.userId === 'beta-user';
+    },
+    getVariant(name, context) {
+      return this.isEnabled(name, context) ? 'treatment' : 'control';
+    },
+  };
+
+  ff.syncFlagsToAdapter(unleashAdapter);
+  ff.registerAdapter('*', unleashAdapter);
+
+  assert.equal(registered.has('serve-frontend'), true);
+  assert.equal(registered.has('campaign-status-cron'), true);
+  assert.equal(ff.isEnabled('serve-frontend', { userId: 'beta-user' }), true);
+  assert.equal(ff.isEnabled('campaign-status-cron', { userId: 'beta-user' }), false);
+});
+
+test('Unleash adapter supports variants for A/B testing', () => {
+  const ff = freshFlags();
+  ff.registerAdapter('serve-frontend', {
+    isEnabled: () => true,
+    getVariant: (name, context) => (context.userId === 'treatment-user' ?
 // ─── requireFlag Middleware ──────────────────────────────────────────
 
 test('requireFlag calls next() when flag is enabled', () => {

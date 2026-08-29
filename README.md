@@ -134,6 +134,12 @@ cd frontend && npm run dev   # http://localhost:5173
 | `SMTP_HOST` / `EMAIL_SERVICE_API_KEY` | Email delivery (optional in dev) |
 | `PERSONA_API_KEY` / `PERSONA_TEMPLATE_ID` | KYC provider (optional in dev) |
 | `AWS_ACCESS_KEY_ID` + S3 vars | Image uploads (optional in dev) |
+| `FEATURE_FLAG_PROVIDER` | Feature flag backend: `env` (default), `unleash`, or `launchdarkly` |
+| `UNLEASH_API_URL` | Unleash API URL (required for Unleash adapter) |
+| `UNLEASH_API_TOKEN` | Unleash API token (required for Unleash adapter) |
+| `UNLEASH_APP_NAME` | Unleash application name (default: `crowdpay`) |
+| `UNLEASH_ENVIRONMENT` | Unleash environment (default: `development`) |
+| `LAUNCHDARKLY_SDK_KEY` | LaunchDarkly SDK key (required for LaunchDarkly adapter) |
 
 Generate a 32-byte key:
 ```bash
@@ -187,6 +193,12 @@ cd frontend && npm test       # Vitest
 **Campaign status cron**: `campaignStatusService.js` runs hourly (via `node-cron` in `backend/src/index.js`) to transition active campaigns to `funded` or `failed` when goals or deadlines are met. Set `ENABLE_CAMPAIGN_STATUS_CRON=false` to disable the in-process scheduler (e.g. when using an external cron that calls `POST /api/campaigns/cron/fail-expired` instead). On each transition, `campaignStatusActions.js` sends emails, fires webhooks, creates in-app notifications, logs the change in `campaign_status_events`, and queues contributor refunds for failed campaigns.
 
 **Weekly digest cron**: `weeklyDigestService.js` runs Sunday evenings by default (`0 18 * * 0`) and sends grouped contributor digests for campaign updates, milestone releases, funded/failed transitions, and upcoming deadlines. Set `ENABLE_WEEKLY_DIGEST_CRON=false` to disable it, or override the schedule with `WEEKLY_DIGEST_CRON`.
+
+---
+
+## Feature Flags
+
+Feature flags use pluggable adapters. In addition to the default `env` adapter, [Unleash](https://www.getunleash.io) and [LaunchDarkly](https://launchdarkly.com) are supported. Set `FEATURE_FLAG_PROVIDER` to one of `env` (default), `unleash`, or `launchdarkly` and configure the corresponding environment variables listed above. If the external service is unavailable, the system automatically falls back to the `env` adapter.
 
 ---
 
