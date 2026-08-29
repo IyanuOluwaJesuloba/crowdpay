@@ -553,9 +553,13 @@ test.describe('Dispute flow', () => {
 
     // Now switch to admin (or creator) to resolve the dispute
     // In a real test, you might use a separate browser context
-    // For simplicity, we'll just navigate to admin dashboard
-    // Here we assume admin has a separate login flow
-    await page.goto('/logout');
+    // For simplicity, we'll just log out via the navbar UI (the app has no /logout route)
+    // and sign in again as admin.
+    const logoutButton = page.getByRole('button', { name: /log ?out/i });
+    if (await logoutButton.isVisible({ timeout: 5_000 }).catch(() => false)) {
+      await logoutButton.click();
+      await expect(page).toHaveURL(/\//, { timeout: 10_000 });
+    }
     await page.goto('/login');
     await page.getByPlaceholder('Email').fill(ADMIN.email);
     await page.getByPlaceholder('Password').fill(ADMIN.password);
