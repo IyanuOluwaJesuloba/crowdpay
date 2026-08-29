@@ -40,6 +40,7 @@ const { recordConfirmedContribution } = require('../services/ledgerMonitor');
 const { emitWebhookEventForUser, emitWebhookEventForCampaign, WEBHOOK_EVENTS } = require('../services/webhookDispatcher');
 const { ERROR_CODES } = require('../services/dispute');
 const { assertUserKycVerified } = require('../services/kycService');
+const { assertContributorMeetsRequirements } = require('../services/contributorIdentityService');
 const asyncHandler = require('../utils/asyncHandler');
 const { getReferralCodeFromRequest } = require('../services/referralService');
 const { resolveReferralLink } = require('../services/referral');
@@ -449,6 +450,20 @@ router.post('/prepare', requireAuth, contributionValidation, validateRequest, as
   const campaign = await loadActiveCampaign(campaign_id);
   if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
+  // Contributor requirements gate (#689) — check before building any XDR
+  try {
+    await assertContributorMeetsRequirements(sender_public_key, campaign_id);
+  } catch (err) {
+    if (err.code === 'CONTRIBUTOR_REQUIREMENTS_NOT_MET') {
+      return res.status(403).json({
+        error: err.message,
+        code: err.code,
+        missing: err.missing,
+      });
+    }
+    throw err;
+  }
+
   if (campaign.min_contribution && parseFloat(amount) < parseFloat(campaign.min_contribution)) {
     return res.status(400).json({ error: `Contribution amount is below the minimum limit of ${campaign.min_contribution} ${campaign.asset_type}` });
   }
@@ -845,6 +860,20 @@ router.post('/', contributionPostLimiter, requireAuth, contributionValidation, v
     [req.user.userId]
   );
   const contributorPublicKey = users[0].wallet_public_key;
+
+  // Contributor requirements gate (#689)
+  try {
+    await assertContributorMeetsRequirements(contributorPublicKey, campaign_id);
+  } catch (err) {
+    if (err.code === 'CONTRIBUTOR_REQUIREMENTS_NOT_MET') {
+      return res.status(403).json({
+        error: err.message,
+        code: err.code,
+        missing: err.missing,
+      });
+    }
+    throw err;
+  }
 
   if (campaign.min_contribution && parseFloat(amount) < parseFloat(campaign.min_contribution)) {
     return res.status(400).json({
