@@ -18,6 +18,6 @@ describe('Pricing page', () => {
     renderWithProviders(<Pricing />);
 
     expect(await screen.findByRole('heading', { name: /Pricing/i })).toBeInTheDocument();
-    expect(screen.getByText(/2.50% of each contribution/i)).toBeInTheDocument();
+    expect(await screen.findByText(/2.50% of each contribution/i)).toBeInTheDocument();
   });
 });

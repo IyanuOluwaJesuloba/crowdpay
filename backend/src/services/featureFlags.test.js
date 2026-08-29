@@ -294,7 +294,13 @@ test('Unleash adapter supports variants for A/B testing', () => {
   const ff = freshFlags();
   ff.registerAdapter('serve-frontend', {
     isEnabled: () => true,
-    getVariant: (name, context) => (context.userId === 'treatment-user' ?
+    getVariant: (name, context) => (context.userId === 'treatment-user' ? 'treatment' : 'control'),
+  });
+
+  assert.equal(ff.getVariant('serve-frontend', { userId: 'treatment-user' }), 'treatment');
+  assert.equal(ff.getVariant('serve-frontend', { userId: 'control-eligible-user' }), 'control');
+});
+
 // ─── requireFlag Middleware ──────────────────────────────────────────
 
 test('requireFlag calls next() when flag is enabled', () => {

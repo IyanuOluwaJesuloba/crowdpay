@@ -244,6 +244,18 @@ function isEnabled(flagName, context = {}) {
  * @returns {string|null} 'control', 'treatment', or null
  */
 function getVariant(flagName, context = {}) {
+  // External adapter takes precedence over static evaluation (same as isEnabled).
+  const adapter = adapters.get(flagName) || adapters.get('*');
+  if (adapter && typeof adapter.getVariant === 'function') {
+    const variant = adapter.getVariant(flagName, context);
+    if (!variant) return null;
+    if (typeof variant === 'object') {
+      if (variant.enabled === false) return null;
+      return typeof variant.name === 'string' && variant.name.length > 0 ? variant.name : null;
+    }
+    return typeof variant === 'string' && variant.length > 0 ? variant : null;
+  }
+
   if (!isEnabled(flagName, context)) return null;
 
   const flag = FLAGS[flagName];
