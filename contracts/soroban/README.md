@@ -45,8 +45,8 @@ A campaign is modelled on-chain as two paired contract instances:
    │     milestones contract        admin (see §3.4 note)        │
    │     address set as the escrow's target                       │
    │   ─ submit_milestone()       ─ deposit(from, amount)         │
-   │   ─ approve_milestone()      ─ approve_withdrawal(amount)    │
-   │       │                      ─ execute_withdrawal(to, amount) │
+   │   ─ approve_milestone()      ─ approve_withdrawal(to, amount)│
+   │       │                      ─ execute_withdrawal(to, amount)│
    │       └── cross-contract ─►                                  │
    │           approve_withdrawal + execute_withdrawal           │
    │   ─ reject_milestone()       ─ refund(contributor)           │
@@ -111,23 +111,26 @@ pub fn initialize(
     deadline: u64,              // unix seconds after which refunds are allowed
     asset: Address,             // Stellar SAC token contract address
     platform_fee_bps: u32,      // fee in basis points, 0..=1000 (10%)
-    platform_fee_recipient: Address,
+    platform_fee_recipient: Address, // platform account (must authorize initialize)
 )
 ```
 
 | Parameter                | Type      | Constraint                                   | Notes |
 |--------------------------|-----------|----------------------------------------------|-------|
-| `admin`                  | `Address` | must be authorised to call `approve_withdrawal`, `propose_fee_change`, `confirm_fee_change`, `cancel_fee_change` | In production **set the milestones contract address as `admin`** and have it authorise the platform's release calls (see §3.4). |
+| `admin`                  | `Address` | must be authorised to call `approve_withdrawal`, `execute_withdrawal`, `propose_fee_change`, `confirm_fee_change`, `cancel_fee_change` | In production **set the milestones contract address as `admin`** and have it authorise the platform's release calls (see §3.4). |
 | `campaign_id`           | `u64`     | any value                                    | Stored but not enforced on-chain. Backend ghosts it back to the campaign row. |
 | `target`                | `i128`    | > 0                                          | Compared against `total_raised` to enable `refund`. |
 | `deadline`              | `u64`     | future unix timestamp                        | `deposit` rejects contributions after the deadline; `refund` requires `now > deadline`. |
 | `asset`                 | `Address` | Stellar SAC token                            | Token transferred on `deposit`/`execute_withdrawal`/`refund`. |
 | `platform_fee_bps`      | `u32`     | `0..=MAX_FEE_BPS` (1000 = 10%)               | Above this the contract panics at init. Two-step change only (`propose_fee_change` → `confirm_fee_change`). |
-| `platform_fee_recipient`| `Address` | valid Stellar account                        | Receives the fee portion on `execute_withdrawal`. |
+| `platform_fee_recipient`| `Address` | valid Stellar account                        | Must authorize initialization (`require_auth`). Receives the fee portion on `execute_withdrawal`. |
 
 #### Events / invariants enforced
+- `platform_fee_recipient.require_auth()` enforced at initialization to ensure only authorized platform accounts initialize contracts.
 - `MAX_FEE_BPS` constant (1000) lives in `escrow/src/lib.rs`; any fee change above it is rejected both at `initialize` *and* at `propose_fee_change` *and* at `confirm_fee_change` (defense-in-depth).
 - Calling `initialize` twice panics with `Contract is already initialized`.
+- `approve_withdrawal(to, amount)` binds the approved release amount explicitly to the `to` address and emits `(Symbol::new("approve_withdrawal"), to)`.
+- `execute_withdrawal(to, amount)` requires `admin.require_auth()`, verifies `approved_withdrawal_for(to) >= amount`, and deducts from the destination-specific approval.
 
 ### 3.2 `milestones.initialize`
 
@@ -143,8 +146,8 @@ pub fn initialize(
 
 | Parameter    | Type              | Constraint                                    | Notes |
 |--------------|-------------------|----------------------------------------------|-------|
-| `creator`   | `Address`         | valid Stellar account                          | `submit_milestone` calls `creator.require_auth()`. |
-| `platform`  | `Address`         | valid Stellar account                          | `approve_milestone` / `reject_milestone` call `platform.require_auth()`. |
+| `creator`   | `Address`         | valid Stellar account (distinct from platform)| `submit_milestone` calls `creator.require_auth()`. |
+| `platform`  | `Address`         | valid Stellar account                          | Must authorize initialization (`require_auth`). `approve_milestone` / `reject_milestone` call `platform.require_auth()`. |
 | `escrow`    | `Address`         | paired escrow instance                         | Used as cross-contract call target. |
 | `milestones`| `Vec<Milestone>`  | **sum of `release_bps` must equal 10000**      | Enforced at init; otherwise panics with `Total BPS must be 10000`. |
 
@@ -171,16 +174,16 @@ Calling `initialize` twice panics with `Already initialized`.
    1. `escrow.get_total_raised()` — read-only; not whitelisted but does not call `require_auth`.
    2. `release_amount = total_raised * release_bps / 10000`.
    3. If `release_amount > 0`:
-      - `escrow.approve_withdrawal(release_amount)` — **requires escrow admin auth** (see §3.4).
-      - `escrow.execute_withdrawal(creator, release_amount)` — performs the token transfer, deducts platform fee.
+      - `escrow.approve_withdrawal(creator, release_amount)` — **requires escrow admin auth** (see §3.4) and binds approved amount to `creator`.
+      - `escrow.execute_withdrawal(creator, release_amount)` — **requires escrow admin auth**, verifies destination approval, performs the token transfer, deducts platform fee.
       - proceeds `release` event.
 6. An `approve` event is emitted regardless of whether funds moved.
 
 ### 3.4 ⚠️ Critical auth requirement: escrow admin must be the milestones contract
 
-`escrow.approve_withdrawal` (line 87–93 of `escrow/src/lib.rs`) calls
+`escrow.approve_withdrawal` and `escrow.execute_withdrawal` call
 `admin.require_auth()`. When `milestones.approve_milestone` invokes
-`approve_withdrawal` cross-contract, the **escrow's `admin` must therefore be
+`approve_withdrawal` and `execute_withdrawal` cross-contract, the **escrow's `admin` must therefore be
 the milestones contract's own address**, otherwise the cross-contract call will
 fail with an authorization error.
 

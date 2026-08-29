@@ -58,6 +58,23 @@ fn test_initialize_sets_state() {
 }
 
 #[test]
+fn test_initialize_requires_fee_recipient_auth() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let fee_recipient = Address::generate(&env);
+        let token_addr = env.register_stellar_asset_contract(admin.clone());
+
+        // Without mock_all_auths, initialize fails because fee_recipient auth is required
+        client.initialize(&admin, &1u64, &1000, &999999, &token_addr, &100, &fee_recipient);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_initialize_rejects_reinit() {
     let env = Env::default();
     let (contract_id, admin, _, fee_recipient) = setup_contract(&env, 1000, 100, 0);
@@ -183,20 +200,12 @@ fn test_cancel_fee_change() {
 
 #[test]
 fn test_fee_change_requires_admin_auth() {
-    // In a fresh env without mock_all_auths, propose must fail without the admin's auth.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let env = Env::default();
         let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        let fee_recipient = Address::generate(&env);
-        let token_addr = env.register_stellar_asset_contract(admin.clone());
-
-        // initialize has no require_auth, so it succeeds without mocked auths.
-        client.initialize(&admin, &1u64, &1000, &999999, &token_addr, &100, &fee_recipient);
-
-        // propose_fee_change requires admin auth, which is not provided here.
+        // Without auth mocking, propose_fee_change fails without admin auth
         client.propose_fee_change(&500);
     }));
     assert!(result.is_err());
@@ -261,8 +270,9 @@ fn test_approve_withdrawal_increases_approved() {
     let (contract_id, admin, _, _fee_recipient) = setup_contract(&env, 1000, 999999, 0);
     let client = EscrowContractClient::new(&env, &contract_id);
 
-    client.approve_withdrawal(&500);
+    client.approve_withdrawal(&admin, &500);
 
+    assert_eq!(client.get_approved_withdrawal(&admin), 500);
     let total_raised: i128 = client.get_total_raised();
     assert_eq!(total_raised, 0);
 }
@@ -279,7 +289,7 @@ fn test_execute_withdrawal_deducts_fee() {
     token_cl.mint(&contributor, &1000);
     client.deposit(&contributor, &1000);
 
-    client.approve_withdrawal(&500);
+    client.approve_withdrawal(&admin, &500);
     client.execute_withdrawal(&admin, &500);
 
     let fee = 50i128;
@@ -289,6 +299,7 @@ fn test_execute_withdrawal_deducts_fee() {
     assert_eq!(token_client.balance(&contributor), 0);
     assert_eq!(token_client.balance(&admin), net);
     assert_eq!(token_client.balance(&fee_recipient), fee);
+    assert_eq!(client.get_approved_withdrawal(&admin), 0);
 }
 
 #[test]
@@ -302,11 +313,12 @@ fn test_execute_withdrawal_no_fee() {
     token_cl.mint(&contributor, &1000);
     client.deposit(&contributor, &1000);
 
-    client.approve_withdrawal(&500);
+    client.approve_withdrawal(&admin, &500);
     client.execute_withdrawal(&admin, &500);
 
     let token_client = token::Client::new(&env, &token_addr);
     assert_eq!(token_client.balance(&admin), 500);
+    assert_eq!(client.get_approved_withdrawal(&admin), 0);
 }
 
 #[test]
@@ -323,55 +335,83 @@ fn test_execute_withdrawal_rejects_insufficient_approval() {
 
 #[test]
 fn test_approve_withdrawal_requires_admin_auth() {
-    let env = Env::default();
-
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let contributor = Address::generate(&env);
-    let fee_recipient = Address::generate(&env);
-    let (token_addr, _token_admin) = install_token(&env);
-
-    let contract_id = env.register(EscrowContract, ());
-    let client = EscrowContractClient::new(&env, &contract_id);
-    client.initialize(
-        &admin,
-        &1u64,
-        &1000,
-        &999999,
-        &token_addr,
-        &0,
-        &fee_recipient,
-    );
-
-    // Reset auth mocks to test that non-admin cannot approve
-    // In a fresh sub-environment, call without any auth
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Create a new env without mock_all_auths to test auth enforcement
-        let env2 = Env::default();
-        let contract_id2 = env2.register(EscrowContract, ());
-        let client2 = EscrowContractClient::new(&env2, &contract_id2);
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
 
-        let admin2 = Address::generate(&env2);
-        let contributor2 = Address::generate(&env2);
-        let fee_recipient2 = Address::generate(&env2);
-        let token_addr2 = env2.register_stellar_asset_contract(admin2.clone());
-
-        // Initialize without mock_all_auths - this works because initialize has no require_auth
-        client2.initialize(
-            &admin2,
-            &1u64,
-            &1000,
-            &999999,
-            &token_addr2,
-            &0,
-            &fee_recipient2,
-        );
-
-        // Try to approve without auth - should fail
-        client2.approve_withdrawal(&100);
+        let admin = Address::generate(&env);
+        // Call without mock_all_auths - approve_withdrawal requires admin auth
+        client.approve_withdrawal(&admin, &100);
     }));
     assert!(result.is_err());
+}
+
+#[test]
+fn test_execute_withdrawal_requires_admin_auth() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let dest = Address::generate(&env);
+        client.execute_withdrawal(&dest, &100);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_execute_withdrawal_rejects_unapproved_destination() {
+    let env = Env::default();
+    let (contract_id, admin, contributor, _fee_recipient) = setup_contract(&env, 1000, 999999, 0);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
+
+    // Approve withdrawal for legitimate admin/creator
+    client.approve_withdrawal(&admin, &500);
+
+    // Attacker tries to execute withdrawal redirecting funds to attacker address
+    let attacker = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_withdrawal(&attacker, &500);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_execute_withdrawal_multiple_destinations_independent() {
+    let env = Env::default();
+    let (contract_id, _admin, contributor, _fee_recipient) = setup_contract(&env, 3000, 999999, 0);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &3000);
+    client.deposit(&contributor, &3000);
+
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+
+    client.approve_withdrawal(&recipient1, &400);
+    client.approve_withdrawal(&recipient2, &600);
+
+    assert_eq!(client.get_approved_withdrawal(&recipient1), 400);
+    assert_eq!(client.get_approved_withdrawal(&recipient2), 600);
+
+    client.execute_withdrawal(&recipient1, &400);
+    assert_eq!(client.get_approved_withdrawal(&recipient1), 0);
+    assert_eq!(client.get_approved_withdrawal(&recipient2), 600);
+
+    let token_client = token::Client::new(&env, &token_addr);
+    assert_eq!(token_client.balance(&recipient1), 400);
+    assert_eq!(token_client.balance(&recipient2), 0);
+
+    client.execute_withdrawal(&recipient2, &600);
+    assert_eq!(client.get_approved_withdrawal(&recipient2), 0);
+    assert_eq!(token_client.balance(&recipient2), 600);
 }
 
 #[test]
@@ -462,7 +502,7 @@ fn test_full_flow_deposit_withdraw_with_fee() {
     let total: i128 = client.get_total_raised();
     assert_eq!(total, 1000);
 
-    client.approve_withdrawal(&800);
+    client.approve_withdrawal(&admin, &800);
     client.execute_withdrawal(&admin, &800);
 
     let fee = 40i128;

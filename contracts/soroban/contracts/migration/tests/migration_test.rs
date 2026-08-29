@@ -81,6 +81,19 @@ fn test_migrate_pauses_v1_and_copies_state_into_v2_emitting_one_event() {
 }
 
 #[test]
+fn test_initialize_requires_platform_auth() {
+    let env = Env::default();
+    let platform = Address::generate(&env);
+    let migration_id = env.register(MigrationContract, ());
+    let migration_client = MigrationContractClient::new(&env, &migration_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        migration_client.initialize(&platform);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_migrate_rejects_non_platform() {
     let env = Env::default();
 
@@ -92,22 +105,22 @@ fn test_migrate_rejects_non_platform() {
         [v1_milestone(&env, b"BBBB1111111111111111111111111111", 10000u32)],
     );
     let v1_id = env.register(MilestonesContract, ());
-    MilestonesContractClient::new(&env, &v1_id).initialize(
+    MilestonesContractClient::new(&env, &v1_id).mock_all_auths().initialize(
         &v1_creator, &platform, &v1_escrow, &v1_milestones,
     );
 
     let v2_creator = Address::generate(&env);
     let v2_escrow = Address::generate(&env);
     let v2_id = env.register(MilestonesV2Contract, ());
-    MilestonesV2ContractClient::new(&env, &v2_id).initialize(
+    MilestonesV2ContractClient::new(&env, &v2_id).mock_all_auths().initialize(
         &v2_creator, &platform, &v2_escrow, &v1_milestones,
     );
 
     let migration_id = env.register(MigrationContract, ());
     let migration_client = MigrationContractClient::new(&env, &migration_id);
-    migration_client.initialize(&platform);
+    migration_client.mock_all_auths().initialize(&platform);
 
-    // No mock_all_auths(): platform.require_auth() inside migrate() must fail.
+    // No mock_all_auths() on migration_client.migrate: platform.require_auth() inside migrate() must fail.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         migration_client.migrate(&v1_id, &v2_id);
     }));

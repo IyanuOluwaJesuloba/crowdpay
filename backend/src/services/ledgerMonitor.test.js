@@ -38,14 +38,25 @@ function buildLedgerMonitor(mockQuery, treasuryStub) {
         XLM: { type: 'native' },
         USDC: { type: 'credit_alphanum4', issuer: 'GTRUSTEDUSDCISSUER' },
       },
+    },
     '../config/logger': {
       info: () => {},
       warn: () => {},
       error: () => {},
     },
     './stellarService': { getCampaignBalance: async () => ({}) },
-    './stellarTransactionService': { markContributionIndexed: async () => {} },
     './rewardTierService': { assignTierToContribution: async () => null },
+    './stellarTransactionService': {
+      markContributionIndexed: async (client, txHash, contributionId) => {
+        const runner = client || mockDb;
+        await runner.query(
+          `UPDATE stellar_transactions
+           SET status = 'indexed', contribution_id = $1, updated_at = NOW()
+           WHERE tx_hash = $2 AND kind = 'contribution'`,
+          [contributionId, txHash]
+        );
+      },
+    },
     './referralService': { attributeContributionToReferrer: async () => {} },
     './reconciliation': { reconcileCampaignBalances: async () => {} },
     './emailService': { sendContributionReceipt: async () => {} },

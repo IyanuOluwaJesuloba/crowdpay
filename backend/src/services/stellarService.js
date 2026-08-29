@@ -571,11 +571,16 @@ async function buildWithdrawalTransaction({
   destinationPublicKey,
   amount,
   asset,
+  commissions = [],
   collectedFees = 0,
   creatorPublicKey = null,
 }) {
   const campaignAccount = await server.loadAccount(campaignWalletPublicKey);
   const stellarAsset = toStellarAsset(asset);
+
+  const payableCommissions = commissions.filter(
+    (commission) => commission.destinationPublicKey && parseFloat(commission.amount) > 0
+  );
 
   const builder = new TransactionBuilder(campaignAccount, {
     fee: BASE_FEE,
@@ -590,6 +595,16 @@ async function buildWithdrawalTransaction({
       amount: String(amount),
     })
   );
+
+  for (const commission of payableCommissions) {
+    builder.addOperation(
+      Operation.payment({
+        destination: commission.destinationPublicKey,
+        asset: stellarAsset,
+        amount: String(commission.amount),
+      })
+    );
+  }
 
   // Creator revenue share payment (if applicable)
   if (collectedFees > 0 && creatorPublicKey) {

@@ -140,7 +140,7 @@ export default function OpsCenter() {
         await loadDashboardData(true);
       }
     } catch (err) {
-      alert(`Failed to acknowledge incident: ${err.message}`);
+      window.alert(`Failed to acknowledge incident: ${err.message}`);
     }
   };
 
@@ -163,10 +163,10 @@ export default function OpsCenter() {
         await loadDashboardData(true);
       } else {
         const errJson = await res.json();
-        alert(`Runbook execution failed: ${errJson.error?.message || 'Unknown error'}`);
+        window.alert(`Runbook execution failed: ${errJson.error?.message || 'Unknown error'}`);
       }
     } catch (err) {
-      alert(`Runbook error: ${err.message}`);
+      window.alert(`Runbook error: ${err.message}`);
     } finally {
       setRunbookExecuting(false);
     }
@@ -179,11 +179,11 @@ export default function OpsCenter() {
       });
       if (res.ok) {
         const json = await res.json();
-        alert(json.message);
+        window.alert(json.message);
         await loadDashboardData(true);
       }
     } catch (err) {
-      alert(`Failed to approve funding: ${err.message}`);
+      window.alert(`Failed to approve funding: ${err.message}`);
     }
   };
 

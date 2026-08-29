@@ -228,7 +228,7 @@ async function auditDatabase() {
        ORDER BY duration_sec DESC
        LIMIT 1`
     );
-    if (rows.length > 0 && rows[0].duration_sec != null) {
+    if (rows.length > 0 && rows[0].duration_sec !== null && rows[0].duration_sec !== undefined) {
       longestQuerySeconds = Math.max(0, parseFloat(rows[0].duration_sec));
       if (longestQuerySeconds > 5) {
         slowQueryDetected = true;

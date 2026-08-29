@@ -146,6 +146,7 @@ impl CampaignTreasury {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(TreasuryError::AlreadyInitialized);
         }
+        platform.require_auth();
         validate_policy(&policy)?;
 
         let storage = env.storage().instance();

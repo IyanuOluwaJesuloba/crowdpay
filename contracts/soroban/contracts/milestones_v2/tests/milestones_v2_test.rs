@@ -49,7 +49,7 @@ impl MockEscrow {
 
     pub fn deposit(_env: Env, _from: Address, _amount: i128) {}
 
-    pub fn approve_withdrawal(env: Env, release_amount: i128) {
+    pub fn approve_withdrawal(env: Env, _to: Address, release_amount: i128) {
         let key = MockDataKey::ApprovedAmount;
         let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
         env.storage().instance().set(&key, &(current + release_amount));
@@ -108,6 +108,25 @@ fn setup_v2_contract(
     client.initialize(&creator, &platform, &escrow_id, &milestones);
 
     (contract_id, creator, platform, escrow_id)
+}
+
+#[test]
+fn test_initialize_requires_platform_auth() {
+    let env = Env::default();
+    let milestones = Vec::from_array(
+        &env,
+        [make_milestone(&env, b"INIT1111111111111111111111111111", 10000u32)],
+    );
+    let creator = Address::generate(&env);
+    let platform = Address::generate(&env);
+    let escrow_id = Address::generate(&env);
+    let contract_id = env.register(MilestonesV2Contract, ());
+    let client = MilestonesV2ContractClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(&creator, &platform, &escrow_id, &milestones);
+    }));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -223,10 +242,6 @@ fn test_migrate_from_v1_copies_all_milestones() {
 
 #[test]
 fn test_migrate_from_v1_rejects_non_platform() {
-    // Built without mock_all_auths() so platform.require_auth() inside
-    // migrate_from_v1 has nothing to authorize against and must fail.
-    // initialize() itself needs no auth in either version, so both
-    // contracts can be set up on this unmocked env.
     let env = Env::default();
     let milestones = Vec::from_array(
         &env,
@@ -237,7 +252,7 @@ fn test_migrate_from_v1_rejects_non_platform() {
     let v1_platform = Address::generate(&env);
     let v1_escrow = env.register(MockEscrow, ());
     let v1_id = env.register(MilestonesV2Contract, ());
-    MilestonesV2ContractClient::new(&env, &v1_id).initialize(
+    MilestonesV2ContractClient::new(&env, &v1_id).mock_all_auths().initialize(
         &v1_creator, &v1_platform, &v1_escrow, &milestones,
     );
 
@@ -246,7 +261,7 @@ fn test_migrate_from_v1_rejects_non_platform() {
     let escrow_id = env.register(MockEscrow, ());
     let v2_id = env.register(MilestonesV2Contract, ());
     let v2_client = MilestonesV2ContractClient::new(&env, &v2_id);
-    v2_client.initialize(&creator, &platform, &escrow_id, &milestones);
+    v2_client.mock_all_auths().initialize(&creator, &platform, &escrow_id, &milestones);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         v2_client.migrate_from_v1(&v1_id);

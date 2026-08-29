@@ -10,6 +10,7 @@ mod test;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
     pub target: i128,
+    pub amount: i128,
     pub released: bool,
 }
 
@@ -22,6 +23,7 @@ pub enum DataKey {
     Creator,
     Token,
     TotalRaised,
+    TotalReleased,
     Contributions(Address),
     Milestones,
     Status,
@@ -44,6 +46,30 @@ impl CrowdPayContract {
         if env.storage().instance().has(&DataKey::CampaignId) {
             panic!("Already initialized");
         }
+        creator.require_auth();
+
+        if goal <= 0 {
+            panic!("Goal must be positive");
+        }
+        if milestones.is_empty() {
+            panic!("Milestones cannot be empty");
+        }
+
+        let mut total_milestone_amount: i128 = 0;
+        for m in milestones.iter() {
+            if m.target <= 0 {
+                panic!("Milestone target must be positive");
+            }
+            if m.amount <= 0 {
+                panic!("Milestone amount must be positive");
+            }
+            total_milestone_amount += m.amount;
+        }
+
+        if total_milestone_amount > goal {
+            panic!("Total milestone allocations cannot exceed goal");
+        }
+
         env.storage().instance().set(&DataKey::CampaignId, &campaign_id);
         env.storage().instance().set(&DataKey::Creator, &creator);
         env.storage().instance().set(&DataKey::Token, &token);
@@ -51,6 +77,7 @@ impl CrowdPayContract {
         env.storage().instance().set(&DataKey::Deadline, &deadline);
         env.storage().instance().set(&DataKey::Milestones, &milestones);
         env.storage().instance().set(&DataKey::TotalRaised, &0i128);
+        env.storage().instance().set(&DataKey::TotalReleased, &0i128);
         env.storage().instance().set(&DataKey::Status, &symbol_short!("Active"));
     }
 
@@ -102,17 +129,34 @@ impl CrowdPayContract {
             panic!("Milestone target not met");
         }
 
-        milestone.released = true;
-        milestones.set(milestone_index, milestone);
-        env.storage().instance().set(&DataKey::Milestones, &milestones);
+        let total_released: i128 = env.storage().instance().get(&DataKey::TotalReleased).unwrap_or(0);
+        let milestone_amount = milestone.amount;
+
+        if total_released + milestone_amount > total_raised {
+            panic!("Release amount exceeds available funds");
+        }
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
         let balance = client.balance(&env.current_contract_address());
         
-        if balance > 0 {
-            client.transfer(&env.current_contract_address(), &creator, &balance);
+        if balance < milestone_amount {
+            panic!("Insufficient contract balance");
         }
+
+        milestone.released = true;
+        milestones.set(milestone_index, milestone);
+        env.storage().instance().set(&DataKey::Milestones, &milestones);
+        env.storage().instance().set(&DataKey::TotalReleased, &(total_released + milestone_amount));
+
+        if milestone_amount > 0 {
+            client.transfer(&env.current_contract_address(), &creator, &milestone_amount);
+        }
+
+        env.events().publish(
+            (symbol_short!("release"), milestone_index),
+            (creator, milestone_amount),
+        );
     }
 
     pub fn refund(env: Env, contributor: Address) {
@@ -156,5 +200,9 @@ impl CrowdPayContract {
 
     pub fn get_total_raised(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0)
+    }
+
+    pub fn get_total_released(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::TotalReleased).unwrap_or(0)
     }
 }

@@ -19,6 +19,7 @@ pub enum DataKey {
     Balances(Address),
     TotalRaised,
     ApprovedWithdrawal,
+    ApprovedWithdrawalFor(Address),
     IsInitialized,
     PlatformFeeBps,
     PlatformFeeRecipient,
@@ -42,6 +43,11 @@ impl EscrowContract {
     ) {
         if env.storage().instance().has(&DataKey::IsInitialized) {
             panic!("Contract is already initialized");
+        }
+        platform_fee_recipient.require_auth();
+
+        if target <= 0 {
+            panic!("Target must be positive");
         }
         if platform_fee_bps > MAX_FEE_BPS {
             panic!("Platform fee BPS must not exceed MAX_FEE_BPS");
@@ -84,12 +90,25 @@ impl EscrowContract {
         );
     }
 
-    pub fn approve_withdrawal(env: Env, release_amount: i128) {
+    pub fn approve_withdrawal(env: Env, to: Address, release_amount: i128) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        if release_amount <= 0 {
+            panic!("Release amount must be positive");
+        }
+
+        let dest_key = DataKey::ApprovedWithdrawalFor(to.clone());
+        let approved_for_to: i128 = env.storage().persistent().get(&dest_key).unwrap_or(0);
+        env.storage().persistent().set(&dest_key, &(approved_for_to + release_amount));
+
         let approved: i128 = env.storage().instance().get(&DataKey::ApprovedWithdrawal).unwrap_or(0);
         env.storage().instance().set(&DataKey::ApprovedWithdrawal, &(approved + release_amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "approve_withdrawal"), to),
+            release_amount,
+        );
     }
 
     /// Step 1 of 2: the admin proposes a new platform fee.
@@ -163,6 +182,19 @@ impl EscrowContract {
     }
 
     pub fn execute_withdrawal(env: Env, to: Address, release_amount: i128) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if release_amount <= 0 {
+            panic!("Release amount must be positive");
+        }
+
+        let dest_key = DataKey::ApprovedWithdrawalFor(to.clone());
+        let mut approved_for_to: i128 = env.storage().persistent().get(&dest_key).unwrap_or(0);
+        if approved_for_to < release_amount {
+            panic!("Insufficient approved amount for destination");
+        }
+
         let mut approved: i128 = env.storage().instance().get(&DataKey::ApprovedWithdrawal).unwrap_or(0);
         if approved < release_amount {
             panic!("Insufficient approved amount");
@@ -183,6 +215,9 @@ impl EscrowContract {
             let fee_recipient: Address = env.storage().instance().get(&DataKey::PlatformFeeRecipient).unwrap();
             client.transfer(&env.current_contract_address(), &fee_recipient, &fee_amount);
         }
+
+        approved_for_to -= release_amount;
+        env.storage().persistent().set(&dest_key, &approved_for_to);
 
         approved -= release_amount;
         env.storage().instance().set(&DataKey::ApprovedWithdrawal, &approved);
@@ -240,5 +275,10 @@ impl EscrowContract {
         let bps: u32 = env.storage().instance().get(&DataKey::PlatformFeeBps).unwrap_or(0);
         let recipient: Address = env.storage().instance().get(&DataKey::PlatformFeeRecipient).unwrap();
         (bps, recipient)
+    }
+
+    pub fn get_approved_withdrawal(env: Env, to: Address) -> i128 {
+        let dest_key = DataKey::ApprovedWithdrawalFor(to);
+        env.storage().persistent().get(&dest_key).unwrap_or(0)
     }
 }

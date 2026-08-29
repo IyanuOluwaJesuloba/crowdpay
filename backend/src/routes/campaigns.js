@@ -32,6 +32,7 @@ const { sendEmail, sendTeamMemberInvitedEmail } = require('../services/emailServ
 const { uploadCampaignCoverImage } = require('../services/storage');
 const { isKycRequiredForCampaigns, getTierLimit, VERIFICATION_TIER_LIMITS } = require('../services/kycProvider');
 const { listCreatorCampaigns } = require('../services/userDashboardService');
+const { getTrendingCampaigns } = require('../services/trendingService');
 const { getRecommendedCampaigns } = require('../services/campaignRecommendationService');
 const { publishDraftCampaign, CampaignNotPublishableError } = require('../services/campaignPublishing');
 const {

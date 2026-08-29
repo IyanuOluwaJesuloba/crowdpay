@@ -56,6 +56,11 @@ impl FeeRegistry {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
+        admin.require_auth();
+
+        if initial_platform_fee_bps > 10000 || initial_creator_share_bps > 10000 {
+            panic!("Invalid fee bps");
+        }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::GovernanceToken, &governance_token);

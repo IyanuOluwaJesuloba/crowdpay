@@ -49,7 +49,7 @@ impl MockEscrow {
 
     pub fn deposit(_env: Env, _from: Address, _amount: i128) {}
 
-    pub fn approve_withdrawal(env: Env, release_amount: i128) {
+    pub fn approve_withdrawal(env: Env, _to: Address, release_amount: i128) {
         let key = MockDataKey::ApprovedAmount;
         let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
         env.storage().instance().set(&key, &(current + release_amount));
@@ -125,7 +125,7 @@ fn setup_no_auth(
 
     let escrow_id = env.register(MockEscrow, ());
     let escrow_client = MockEscrowClient::new(&env, &escrow_id);
-    escrow_client.initialize(
+    escrow_client.mock_all_auths().initialize(
         &platform,
         &1u64,
         &10000,
@@ -148,9 +148,28 @@ fn setup_no_auth(
     let contract_id = env.register(MilestonesContract, ());
     let client = MilestonesContractClient::new(&env, &contract_id);
 
-    client.initialize(&creator, &platform, &escrow_id, &milestones);
+    client.mock_all_auths().initialize(&creator, &platform, &escrow_id, &milestones);
 
     (contract_id, creator, platform)
+}
+
+#[test]
+fn test_initialize_requires_platform_auth() {
+    let env = Env::default();
+    let milestones = Vec::from_array(
+        &env,
+        [make_milestone(&env, b"INIT1111111111111111111111111111", 10000u32)],
+    );
+    let creator = Address::generate(&env);
+    let platform = Address::generate(&env);
+    let escrow_id = Address::generate(&env);
+    let contract_id = env.register(MilestonesContract, ());
+    let client = MilestonesContractClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(&creator, &platform, &escrow_id, &milestones);
+    }));
+    assert!(result.is_err());
 }
 
 #[test]

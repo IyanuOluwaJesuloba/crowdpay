@@ -22,6 +22,7 @@ impl MigrationContract {
         if env.storage().instance().has(&DataKey::Initialized) {
             panic!("Already initialized");
         }
+        platform.require_auth();
         env.storage().instance().set(&DataKey::Platform, &platform);
         env.storage().instance().set(&DataKey::Initialized, &true);
     }

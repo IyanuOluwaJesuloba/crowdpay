@@ -60,6 +60,14 @@ impl MilestonesV2Contract {
         if env.storage().instance().has(&DataKey::Initialized) {
             panic!("Already initialized");
         }
+        platform.require_auth();
+
+        if creator == platform {
+            panic!("Creator and platform must be distinct");
+        }
+        if milestones.is_empty() {
+            panic!("Milestones cannot be empty");
+        }
 
         let mut total_bps: u32 = 0;
         for m in milestones.iter() {
@@ -174,7 +182,7 @@ impl MilestonesV2Contract {
         let release_amount = (total_raised * (release_bps as i128)) / 10000;
 
         if release_amount > 0 {
-            let _ : () = env.invoke_contract(&escrow_address, &Symbol::new(&env, "approve_withdrawal"), (release_amount,).into_val(&env));
+            let _ : () = env.invoke_contract(&escrow_address, &Symbol::new(&env, "approve_withdrawal"), (creator.clone(), release_amount).into_val(&env));
             let _ : () = env.invoke_contract(&escrow_address, &Symbol::new(&env, "execute_withdrawal"), (creator.clone(), release_amount).into_val(&env));
 
             env.events().publish(

@@ -207,7 +207,7 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
     'SELECT wallet_public_key FROM users WHERE id = $1',
     [req.user.userId]
   );
-  const creatorPublicKey = creatorRows[0].wallet_public_key;
+  const creatorPublicKey = creatorRows[0]?.wallet_public_key || null;
 
   const multisig = await getAccountMultisigConfig(campaign.wallet_public_key);
   if (
@@ -227,7 +227,27 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
      WHERE campaign_id = $1 AND refunded = FALSE`,
     [campaign_id]
   );
-  const collectedFees = Number(feeRows[0].total_fees) || 0;
+  const collectedFees = Number(feeRows?.[0]?.total_fees) || 0;
+
+  // Referral commissions are settled out of the campaign balance in the same
+  // transaction as the creator payout (#675).
+  const { commissions, totalCommission } = await calculateCommissions(campaign_id);
+  const payableCommissions = commissions.filter(
+    (commission) => commission.destination_public_key && parseFloat(commission.commission_owed) > 0
+  );
+  const commissionTotal = payableCommissions.reduce(
+    (sum, commission) => sum + parseFloat(commission.commission_owed),
+    0
+  );
+  const creatorAmount = (parseFloat(amount) - commissionTotal).toFixed(7);
+
+  if (parseFloat(creatorAmount) <= 0) {
+    return res.status(422).json({
+      error: `Referral commissions of ${totalCommission} ${campaign.asset_type} exceed the requested withdrawal amount. Withdraw a larger amount.`,
+      code: 'COMMISSIONS_EXCEED_WITHDRAWAL',
+      total_commission: totalCommission,
+    });
+  }
 
   const xdr = await buildWithdrawalTransaction({
     campaignWalletPublicKey: campaign.wallet_public_key,
@@ -236,6 +256,10 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
     asset: campaign.asset_type,
     collectedFees,
     creatorPublicKey,
+    commissions: payableCommissions.map((commission) => ({
+      destinationPublicKey: commission.destination_public_key,
+      amount: commission.commission_owed,
+    })),
   });
 
   const client = await db.connect();
@@ -557,7 +581,7 @@ const platformApproveHandler = async (req, res) => {
        WHERE campaign_id = $1 AND refunded = FALSE`,
       [updatedWithdrawalRow.campaign_id]
     );
-    const collectedFees = Number(feeRows[0].total_fees) || 0;
+    const collectedFees = Number(feeRows?.[0]?.total_fees) || 0;
 
     if (collectedFees > 0) {
       const creatorShare = await calculateCreatorShare(collectedFees);
@@ -600,6 +624,19 @@ const platformApproveHandler = async (req, res) => {
         }
       }
     }
+
+    // Record the commissions now settled on-chain so a later withdrawal for the
+    // same campaign does not pay the same referrers twice (#675).
+    const { rows: withdrawalTxRows } = await finalizeClient.query(
+      `SELECT metadata FROM stellar_transactions
+       WHERE withdrawal_request_id = $1 AND kind = 'withdrawal'
+       LIMIT 1`,
+      [req.params.id]
+    );
+    await settleCommissions(
+      finalizeClient,
+      withdrawalTxRows?.[0]?.metadata?.referral_commissions || []
+    );
 
     await finalizeWithdrawalSubmitted(finalizeClient, {
       withdrawalRequestId: req.params.id,
