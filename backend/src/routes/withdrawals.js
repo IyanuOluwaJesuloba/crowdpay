@@ -12,6 +12,9 @@ const {
   submitSignedWithdrawal,
   isXdrExpired,
   PLATFORM_PUBLIC_KEY,
+  validateSubmittedWithdrawalXdr,
+  validateWithdrawalForPlatformSigning,
+  WithdrawalValidationError,
 } = require('../services/stellarService');
 const { calculateCreatorShare } = require('../services/feeRegistry');
 const {
@@ -314,7 +317,7 @@ router.post('/request', requireAuth, withdrawalValidation, validateRequest, asyn
 
 router.post('/:id/approve/creator', requireAuth, async (req, res) => {
   const { rows: requests } = await db.query(
-    `SELECT wr.*, c.creator_id, c.status AS campaign_status
+    `SELECT wr.*, c.creator_id, c.wallet_public_key AS campaign_wallet_public_key, c.asset_type, c.status AS campaign_status
      FROM withdrawal_requests wr
      JOIN campaigns c ON c.id = wr.campaign_id
      WHERE wr.id = $1`,
@@ -351,24 +354,16 @@ router.post('/:id/approve/creator', requireAuth, async (req, res) => {
       const { signed_xdr } = req.body || {};
       if (!signed_xdr) return res.status(400).json({ error: 'signed_xdr is required for freighter users' });
 
-      // Validate the signed_xdr contains a valid signature from the creator's public key
-      try {
-        // validate signature by verifying at least one signature matches user's public key
-        const tx = require('@stellar/stellar-sdk').TransactionBuilder.fromXDR(signed_xdr, require('../config/stellar').networkPassphrase);
-        const signer = require('@stellar/stellar-sdk').Keypair.fromPublicKey(userRow.wallet_public_key);
-        const signatureValid = tx.signatures.some((decorated) => {
-          try {
-            return signer.verify(tx.hash(), decorated.signature());
-          } catch (_err) {
-            return false;
-          }
-        });
-        if (!signatureValid) {
-          return res.status(422).json({ error: 'Signed transaction does not include a valid signature by the creator' });
-        }
-      } catch (err) {
-        return res.status(422).json({ error: 'Invalid signed_xdr' });
-      }
+      // Validate the signed_xdr matches server-generated unsigned_xdr and approved parameters
+      validateSubmittedWithdrawalXdr({
+        signedXdr: signed_xdr,
+        unsignedXdr: requestRow.unsigned_xdr,
+        creatorPublicKey: userRow.wallet_public_key,
+        campaignWalletPublicKey: requestRow.campaign_wallet_public_key,
+        expectedDestination: requestRow.destination_key,
+        expectedAsset: requestRow.asset_type,
+        expectedAmount: requestRow.amount,
+      });
 
       signedXdr = signed_xdr;
     } else {
@@ -390,6 +385,19 @@ router.post('/:id/approve/creator', requireAuth, async (req, res) => {
       withdrawal_id: req.params.id,
       error: err.message,
     });
+    if (
+      err.name === 'WithdrawalValidationError' ||
+      err.isValidationError ||
+      err.statusCode === 422 ||
+      err.message?.includes('signed_xdr') ||
+      err.message?.includes('unsigned_xdr') ||
+      err.message?.includes('Signed transaction') ||
+      err.message?.includes('Transaction') ||
+      err.message?.includes('destination') ||
+      err.message?.includes('does not match')
+    ) {
+      return res.status(422).json({ error: err.message });
+    }
     return res.status(503).json({ error: 'Creator wallet signing is unavailable; retry shortly.' });
   }
 
@@ -433,7 +441,7 @@ const platformApproveHandler = async (req, res) => {
     await client.query('BEGIN');
 
     const { rows: requests } = await client.query(
-      `SELECT wr.*, c.status AS campaign_status
+      `SELECT wr.*, c.status AS campaign_status, c.wallet_public_key AS campaign_wallet_public_key, c.asset_type, c.creator_id
        FROM withdrawal_requests wr
        JOIN campaigns c ON c.id = wr.campaign_id
        WHERE wr.id = $1
@@ -471,6 +479,32 @@ const platformApproveHandler = async (req, res) => {
       );
       await client.query('COMMIT');
       return res.status(410).json({ error: 'Withdrawal XDR has expired' });
+    }
+
+    // Fetch creator's public key for signature validation
+    const { rows: creatorUserRows } = await client.query(
+      'SELECT wallet_public_key FROM users WHERE id = $1',
+      [requestRow.requested_by]
+    );
+    const creatorPublicKey = creatorUserRows[0]?.wallet_public_key;
+
+    // Validate source, destination, asset, amount, sequence, network, and operation set before platform signing
+    try {
+      validateWithdrawalForPlatformSigning({
+        xdr: requestRow.unsigned_xdr,
+        creatorPublicKey,
+        campaignWalletPublicKey: requestRow.campaign_wallet_public_key,
+        expectedDestination: requestRow.destination_key,
+        expectedAsset: requestRow.asset_type,
+        expectedAmount: requestRow.amount,
+      });
+    } catch (valErr) {
+      await client.query('ROLLBACK');
+      logger.error('Withdrawal validation failed before platform signing', {
+        withdrawal_id: req.params.id,
+        error: valErr.message,
+      });
+      return res.status(422).json({ error: valErr.message });
     }
 
     fullySignedXdr = signTransactionXdr({
