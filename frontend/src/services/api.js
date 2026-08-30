@@ -718,4 +718,18 @@ export const api = {
     request('PATCH', `/users/me/recurring-contributions/${id}`, body),
   deleteRecurringContribution: (id) =>
     request('DELETE', `/users/me/recurring-contributions/${id}`),
+
+  // ── Contributor Identity & Reputation (#689) ─────────────────────
+  registerContributorIdentity: () =>
+    request('POST', '/contributor/identity/register', {}),
+  getContributorIdentityProfile: (publicKey) =>
+    request('GET', `/contributor/identity/${encodeURIComponent(publicKey)}`),
+  verifyContributorAttestation: (publicKey, attestation) =>
+    request('GET', `/contributor/identity/${encodeURIComponent(publicKey)}/verify`, null, {
+      query: { attestation },
+    }),
+  getCampaignRequirements: (campaignId) =>
+    request('GET', `/campaigns/${encodeURIComponent(campaignId)}/requirements`),
+  setCampaignRequirements: (campaignId, body) =>
+    request('POST', `/campaigns/${encodeURIComponent(campaignId)}/requirements`, body),
 };

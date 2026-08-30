@@ -2,6 +2,7 @@ const db = require('../config/database');
 const logger = require('../config/logger');
 const { extractWebhookResult, verifyPersonaWebhookSignature } = require('../services/kycProvider');
 const { sendKycApprovedEmail, sendKycRejectedEmail } = require('../services/emailService');
+const { issueKycAttestation, attestationTypeForTier } = require('../services/contributorIdentityService');
 
 function frontendBaseUrl() {
   return (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
@@ -57,7 +58,7 @@ async function handleKycWebhook(req, res) {
            END,
            persona_inquiry_id = COALESCE($2, persona_inquiry_id)
        WHERE ${lookup}
-       RETURNING id, email, name, kyc_status, kyc_completed_at, verification_status, verification_tier`,
+       RETURNING id, email, name, kyc_status, kyc_completed_at, verification_status, verification_tier, wallet_public_key`,
       [...params, result.tier || 'basic']
     );
 
@@ -80,6 +81,22 @@ async function handleKycWebhook(req, res) {
       );
     } catch (eventErr) {
       logger.warn('Failed to record KYC event', { user_id: rows[0].id, error: eventErr.message });
+    }
+
+    // Issue on-chain KYC attestation (#689) when the verification is approved.
+    // Fire-and-forget — a Soroban RPC hiccup must not block the webhook response.
+    if (rows[0].kyc_status === 'verified' && rows[0].wallet_public_key) {
+      issueKycAttestation(
+        rows[0].wallet_public_key,
+        rows[0].id,
+        result.tier || 'basic',
+        result.providerReference
+      ).catch((err) =>
+        logger.warn('KYC on-chain attestation failed', {
+          user_id: rows[0].id,
+          error: err.message,
+        })
+      );
     }
 
     if (rows[0].email) {
