@@ -23,6 +23,7 @@ const { processContributionMatch } = require("./sponsorMatchingService");
 const { indexContribution: indexTreasuryContribution } = require("./contractTreasury");
 const cache = require("../utils/cache");
 const Sentry = require("@sentry/node");
+const { HorizonIngestionWorker, defaultIngestionWorker } = require("./horizonIngestionWorker");
 
 /** wallet_public_key -> stream metadata */
 const streamRegistry = new Map();
@@ -53,6 +54,7 @@ function removeSSEClient(campaignId, res) {
  * Called when streams are closed, campaigns are deleted, or reconnects are abandoned.
  */
 function cleanupStreamForWallet(walletPublicKey) {
+  defaultIngestionWorker.unregisterWallet(walletPublicKey);
   const entry = streamRegistry.get(walletPublicKey);
   if (entry && typeof entry.close === "function") {
     try {
@@ -803,9 +805,25 @@ async function recordConfirmedContribution({
   }
 
   /**
-   * REST-replay from DB cursor, then open SSE stream (with auto-reconnect on errors).
+   * REST-replay from DB cursor, then register with Horizon Ingestion Worker.
+   * Supports both positional args (campaignId, walletPublicKey) and object param ({ campaignId, walletPublicKey, cursor }).
    */
-  async function watchCampaignWallet(campaignId, walletPublicKey) {
+  async function watchCampaignWallet(campaignIdOrOpts, walletPublicKeyArg) {
+    let campaignId;
+    let walletPublicKey;
+    let cursor;
+
+    if (campaignIdOrOpts && typeof campaignIdOrOpts === "object") {
+      campaignId = campaignIdOrOpts.campaignId;
+      walletPublicKey = campaignIdOrOpts.walletPublicKey;
+      cursor = campaignIdOrOpts.cursor;
+    } else {
+      campaignId = campaignIdOrOpts;
+      walletPublicKey = walletPublicKeyArg;
+    }
+
+    if (!campaignId || !walletPublicKey) return;
+
     const existing = streamRegistry.get(walletPublicKey);
     if (
       existing &&
@@ -823,6 +841,8 @@ async function recordConfirmedContribution({
       streamRegistry.delete(walletPublicKey);
     }
 
+    await defaultIngestionWorker.registerWallet(campaignId, walletPublicKey, cursor);
+
     await replayMissedPayments(campaignId, walletPublicKey);
     await openStreamForWallet(campaignId, walletPublicKey);
   }
@@ -830,6 +850,8 @@ async function recordConfirmedContribution({
   const RECONCILE_INTERVAL_MS = 10 * 60 * 1000;
 
   async function startLedgerMonitor() {
+    await defaultIngestionWorker.start();
+
     const { rows } = await db.query(
       `SELECT id, wallet_public_key FROM campaigns WHERE status IN ('active', 'funded')`,
     );
@@ -847,7 +869,7 @@ async function recordConfirmedContribution({
       ),
     );
 
-    logger.info("Watching active and funded campaigns", {
+    logger.info("Watching active and funded campaigns via Horizon Ingestion Worker", {
       campaign_count: rows.length,
     });
 
@@ -863,7 +885,7 @@ async function recordConfirmedContribution({
       () => {
         getLedgerStreamHealth()
           .then((h) => {
-            const bad = h.streams.filter((s) => s.stale_stream_no_messages_15m);
+            const bad = (h.streams || []).filter((s) => s.stale_stream_no_messages_15m);
             if (bad.length) {
               logger.warn("Ledger stream health: connected streams idle >15m", {
                 wallet_public_keys: bad.map((b) => b.wallet_public_key),
@@ -880,8 +902,10 @@ async function recordConfirmedContribution({
     );
   }
 
-  /** For GET /health/ledger — in-process stream status + DB cursors. */
+  /** For GET /health/ledger — in-process stream status + DB cursors + worker metrics. */
   async function getLedgerStreamHealth() {
+    const workerHealth = defaultIngestionWorker.getHealth();
+
     const { rows: dbCursors } = await db.query(
       `SELECT c.id AS campaign_id, c.wallet_public_key, c.status AS campaign_status,
             lc.last_cursor, lc.updated_at AS cursor_updated_at
@@ -892,17 +916,24 @@ async function recordConfirmedContribution({
 
     const streams = dbCursors.map((row) => {
       const live = streamRegistry.get(row.wallet_public_key) || {};
+      const workerStream = (workerHealth.streams || []).find(
+        (s) => s.wallet_public_key === row.wallet_public_key,
+      );
+      const streamState =
+        workerStream?.stream_state || live.state || "not_connected";
+
       return {
         campaign_id: row.campaign_id,
         wallet_public_key: row.wallet_public_key,
         campaign_status: row.campaign_status,
-        last_cursor: row.last_cursor || null,
+        last_cursor: row.last_cursor || workerStream?.last_cursor || null,
         cursor_updated_at: row.cursor_updated_at || null,
-        stream_state: live.state || "not_connected",
+        stream_state: streamState,
         stream_opened_at: live.opened_at || null,
         last_stream_message_at: live.last_message_at || null,
         last_stream_error: live.last_error || null,
         reconnect_attempt:
+          workerStream?.reconnect_attempt ||
           live.reconnect_attempt ||
           reconnectAttempts.get(row.wallet_public_key) ||
           0,
@@ -923,6 +954,10 @@ async function recordConfirmedContribution({
 
     return {
       active_campaigns: streamsWithStale.length,
+      worker_status: workerHealth.worker_status,
+      queue_depth: workerHealth.queue_depth,
+      throughput_eps: workerHealth.throughput_eps,
+      metrics: workerHealth.metrics,
       streams: streamsWithStale,
     };
   }
@@ -937,4 +972,6 @@ async function recordConfirmedContribution({
     addSSEClient,
     removeSSEClient,
     cleanupStreamForWallet,
+    HorizonIngestionWorker,
+    defaultIngestionWorker,
   };
