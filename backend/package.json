@@ -9,8 +9,11 @@
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "test": "NODE_ENV=test JWT_SECRET=testsecret API_KEY_PEPPER=testpeppersecret USDC_ISSUER=GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5 STELLAR_NETWORK=testnet PLATFORM_SECRET_KEY=SCVMQUS5EMTHWBLJTE5XCSCMHB2ZOVKRR4ATVTRPUNRCOGKRENIL3LHR ARBITRATOR_SECRET_KEY=SD5R3ADP7AC37OAYWYG73266DR2MBR6IJGXBLLAGCOWMTHLMPFAJMWPM STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org WALLET_SECRET_LOCAL_KEK=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= WALLET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa node --test src/**/*.test.js",
-    "migrate": "node db/migrate.js",
-    "migrate:fresh": "psql $DATABASE_URL -f db/schema.sql && node db/migrate.js",
+    "migrate": "node db/migrate.js up",
+    "migrate:up": "node db/migrate.js up",
+    "migrate:status": "node db/migrate.js status",
+    "migrate:down": "node db/migrate.js down",
+    "migrate:fresh": "psql $DATABASE_URL -f db/schema.sql && node db/migrate.js up",
     "rotate-wallet-secrets": "node src/scripts/rotateWalletSecrets.js"
   },
   "dependencies": {
