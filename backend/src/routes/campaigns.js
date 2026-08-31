@@ -1979,6 +1979,12 @@ router.patch('/:id', requireAuth, asyncHandler(async (req, res) => {
     });
   }
 
+  // Invalidate cached campaign payloads so any downstream consumer (e.g. the
+  // contribution receipt email path or embed widgets) never serves a stale
+  // campaign title after a rename (#733).
+  cache.invalidate(`campaigns:id:${campaignId}`);
+  cache.invalidatePrefix('campaigns:list:');
+
   res.json(updatedRows[0]);
 }));
 
