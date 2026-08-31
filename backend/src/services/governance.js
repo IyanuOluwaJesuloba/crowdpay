@@ -220,6 +220,152 @@ async function getUserTokenBalance(publicKey) {
 }
 
 /**
+ * Load every vote delegation edge into an in-memory map.
+ * Returns { delegatorToDelegate, delegateToDelegators }.
+ */
+async function loadDelegationMap() {
+  const { rows } = await db.query(
+    `SELECT delegator_public_key, delegate_public_key
+     FROM governance_delegations`
+  );
+
+  const delegatorToDelegate = new Map();
+  const delegateToDelegators = new Map();
+
+  for (const row of rows) {
+    delegatorToDelegate.set(row.delegator_public_key, row.delegate_public_key);
+    if (!delegateToDelegators.has(row.delegate_public_key)) {
+      delegateToDelegators.set(row.delegate_public_key, []);
+    }
+    delegateToDelegators.get(row.delegate_public_key).push(row.delegator_public_key);
+  }
+
+  return { delegatorToDelegate, delegateToDelegators };
+}
+
+/**
+ * Check whether assigning delegator -> delegate would introduce a cycle or a
+ * self-delegation. The delegation graph is a collection of trees (each wallet
+ * points at at most one target), so a cycle is introduced only when following
+ * the delegate's own delegate chain eventually reaches the delegator.
+ */
+async function assignmentIsValid(delegatorPublicKey, delegatePublicKey) {
+  if (delegatorPublicKey === delegatePublicKey) {
+    return { ok: false, reason: 'cannot delegate to yourself' };
+  }
+
+  const { delegatorToDelegate } = await loadDelegationMap();
+
+  let cursor = delegatePublicKey;
+  const seen = new Set();
+  while (cursor && !seen.has(cursor)) {
+    if (cursor === delegatorPublicKey) {
+      return { ok: false, reason: 'delegation would create a circular reference' };
+    }
+    seen.add(cursor);
+    cursor = delegatorToDelegate.get(cursor);
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Set (or replace) a wallet's voting-power delegation.
+ * @param {string} delegatorPublicKey - Wallet giving up its vote power
+ * @param {string} delegatePublicKey - Wallet receiving the delegated power
+ * @returns {Promise<object>} The active delegation edge
+ */
+async function setVoteDelegation(delegatorPublicKey, delegatePublicKey) {
+  const { ok, reason } = await assignmentIsValid(delegatorPublicKey, delegatePublicKey);
+  if (!ok) {
+    throw Object.assign(new Error(reason), { code: 'INVALID_DELEGATION' });
+  }
+
+  const { rows } = await db.query(
+    `INSERT INTO governance_delegations (delegator_public_key, delegate_public_key)
+     VALUES ($1, $2)
+     ON CONFLICT (delegator_public_key)
+     DO UPDATE SET delegate_public_key = EXCLUDED.delegate_public_key,
+                   updated_at = NOW()
+     RETURNING delegator_public_key, delegate_public_key, created_at, updated_at`,
+    [delegatorPublicKey, delegatePublicKey]
+  );
+
+  return rows[0];
+}
+
+/**
+ * Revoke a wallet's vote delegation (returns its power directly to the wallet).
+ * @param {string} delegatorPublicKey - Wallet withdrawing its delegation
+ * @returns {Promise<boolean>} Whether a delegation existed and was removed
+ */
+async function revokeVoteDelegation(delegatorPublicKey) {
+  const { rows } = await db.query(
+    `DELETE FROM governance_delegations
+     WHERE delegator_public_key = $1
+     RETURNING id`,
+    [delegatorPublicKey]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Get the wallet a given delegator currently points at (or null).
+ */
+async function getDelegateForWallet(publicKey) {
+  const { rows } = await db.query(
+    `SELECT delegator_public_key, delegate_public_key
+     FROM governance_delegations
+     WHERE delegator_public_key = $1`,
+    [publicKey]
+  );
+  return rows.length ? rows[0] : null;
+}
+
+/**
+ * Collect every wallet that, directly or transitively, delegates its vote
+ * power to `publicKey`. A voter's power is the sum of their own balance plus
+ * the balances of every wallet in this set (their own balances, not balances
+ * further delegated down the chain, which are already attributed one level up).
+ */
+async function getAllTransitiveDelegatorWallets(publicKey) {
+  const { delegateToDelegators } = await loadDelegationMap();
+  const delegators = new Set();
+  const queue = [publicKey];
+
+  while (queue.length) {
+    const current = queue.shift();
+    const direct = delegateToDelegators.get(current) || [];
+    for (const wallet of direct) {
+      if (!delegators.has(wallet)) {
+        delegators.add(wallet);
+        queue.push(wallet);
+      }
+    }
+  }
+
+  return Array.from(delegators);
+}
+
+/**
+ * Compute a wallet's effective governance voting weight by traversing the
+ * delegation chain: its own CROWD balance plus the CROWD balance of every
+ * delegator that points at it (recursively through the chain).
+ * @param {string} publicKey - Stellar public key
+ * @returns {Promise<number>} Effective vote weight
+ */
+async function getEffectiveVoteWeight(publicKey) {
+  const delegateWallets = await getAllTransitiveDelegatorWallets(publicKey);
+  let weight = await getUserTokenBalance(publicKey);
+
+  for (const wallet of delegateWallets) {
+    weight += await getUserTokenBalance(wallet);
+  }
+
+  return weight;
+}
+
+/**
  * Create a proposal on-chain.
  * @param {string} proposerPublicKey - Proposer's Stellar public key
  * @param {number} newFeeBps - Proposed platform fee in basis points
@@ -318,9 +464,10 @@ async function voteOnProposal(proposalId, voterPublicKey, inFavor, signerSecret)
     throw new Error('Proposal is not active for voting');
   }
 
-  // Check if user holds tokens
-  const tokenBalance = await getUserTokenBalance(voterPublicKey);
-  if (tokenBalance <= 0) {
+  // Effective vote weight accounts for delegated power (#735): the voter's own
+  // balance plus every wallet that delegates to them, traversed recursively.
+  const effectiveWeight = await getEffectiveVoteWeight(voterPublicKey);
+  if (effectiveWeight <= 0) {
     throw new Error('Voter must hold governance tokens');
   }
 
@@ -343,15 +490,15 @@ async function voteOnProposal(proposalId, voterPublicKey, inFavor, signerSecret)
       VALUES ($1, $2, $3, $4, NOW())
     `;
 
-    await db.query(insertVoteQuery, [proposalId, voterPublicKey, inFavor, tokenBalance]);
+    await db.query(insertVoteQuery, [proposalId, voterPublicKey, inFavor, effectiveWeight]);
 
-    logger.info('Vote recorded', { proposalId, voter: voterPublicKey, inFavor });
+    logger.info('Vote recorded', { proposalId, voter: voterPublicKey, inFavor, weight: effectiveWeight });
 
     return {
       proposal_id: proposalId,
       voter: voterPublicKey,
       in_favor: inFavor,
-      token_balance: tokenBalance,
+      token_balance: effectiveWeight,
     };
   } catch (error) {
     logger.error('Failed to vote on proposal', { error: error.message, proposalId });
@@ -467,4 +614,9 @@ module.exports = {
   voteOnProposal,
   executeProposal,
   syncProposalData,
+  setVoteDelegation,
+  revokeVoteDelegation,
+  getDelegateForWallet,
+  getEffectiveVoteWeight,
+  getAllTransitiveDelegatorWallets,
 };

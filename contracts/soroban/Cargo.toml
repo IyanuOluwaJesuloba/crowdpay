@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "contracts/campaign_treasury",
+  "contracts/contributor_identity",
   "contracts/crowdpay",
   "contracts/escrow",
   "contracts/fee_registry",

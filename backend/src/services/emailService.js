@@ -24,6 +24,7 @@ const thankYouEmail = require("../emails/thankYou");
 const walletFundingFailedEmail = require("../emails/walletFundingFailed");
 const campaignCommentEmail = require("../emails/campaignComment");
 const fundsReleasedEmail = require("../emails/fundsReleased");
+const recurringContributionNoticeEmail = require("../emails/recurringContributionNotice");
 
 let transporter;
 
@@ -117,6 +118,30 @@ async function sendWelcomeEmail({ to, name, walletPublicKey }) {
   if (!to) return;
   const { subject, text, html } = welcomeEmail.build({ name, walletPublicKey });
   await sendIdempotent({ dedupeKey: `welcome:${to}`, to, subject, text, html });
+}
+
+/**
+ * Sends a recurring automated-billing notification (#738). `kind` is one of
+ * 'upcoming' | 'charged' | 'failed'. `recurringRunKey` identifies the exact
+ * charge attempt so the message is sent at most once per occurrence.
+ */
+async function sendRecurringContributionNoticeEmail({ to, kind, recurringRunKey, ...params }) {
+  if (!to) return;
+  if (!['upcoming', 'charged', 'failed'].includes(kind)) return;
+
+  let built;
+  if (kind === 'upcoming') built = recurringContributionNoticeEmail.buildUpcoming(params);
+  else if (kind === 'charged') built = recurringContributionNoticeEmail.buildCharged(params);
+  else built = recurringContributionNoticeEmail.buildFailed(params);
+
+  const { subject, text, html } = built;
+  await sendIdempotent({
+    dedupeKey: `recurring_notice:${kind}:${recurringRunKey}`,
+    to,
+    subject,
+    text,
+    html,
+  });
 }
 
 async function sendContributionReceipt({
@@ -348,6 +373,7 @@ module.exports = {
   isCampaignUpdateUnsubscribed,
   getStellarExpertTxUrl,
   sendContributionReceipt,
+  sendRecurringContributionNoticeEmail,
   sendWelcomeEmail,
   sendWalletFundingFailedEmail,
   sendCampaignFundedCreatorEmail,

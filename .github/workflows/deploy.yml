@@ -89,6 +89,49 @@ jobs:
           echo "Health check failed after 10 attempts"
           exit 1
 
+      - name: Rollback on health check failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: DATABASE_URL,JWT_SECRET,API_KEY_PEPPER,PLATFORM_SECRET_KEY,USDC_ISSUER,STELLAR_NETWORK,STELLAR_HORIZON_URL,FRONTEND_URL,DEPLOY_PATH,SENTRY_RELEASE
+          script: |
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+            if [ ! -f .previous-deploy-sha ]; then
+              echo "No previous deploy SHA recorded; skipping rollback"
+              exit 0
+            fi
+            PREVIOUS_SHA=$(cat .previous-deploy-sha)
+            echo "Rolling back to previous deployment SHA: $PREVIOUS_SHA"
+            git reset --hard "$PREVIOUS_SHA"
+            docker compose -f docker-compose.prod.yml up -d --build
+            docker compose -f docker-compose.prod.yml exec -T backend node db/migrate.js
+            echo "Rolled back and redeployed $PREVIOUS_SHA"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          API_KEY_PEPPER: ${{ secrets.API_KEY_PEPPER }}
+          PLATFORM_SECRET_KEY: ${{ secrets.PLATFORM_SECRET_KEY }}
+          USDC_ISSUER: ${{ secrets.USDC_ISSUER }}
+          STELLAR_NETWORK: ${{ secrets.STELLAR_NETWORK }}
+          STELLAR_HORIZON_URL: ${{ secrets.STELLAR_HORIZON_URL }}
+          FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          SENTRY_RELEASE: ${{ github.sha }}
+
+      - name: Notify Slack on rollback
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          fields: repo,commit,author
+          text: Deployment failed health check and was automatically rolled back to the previous release on ${{ secrets.DEPLOY_HOST }}.
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
       - name: Post deploy status to Slack
         uses: 8398a7/action-slack@v3
         with:
@@ -96,4 +139,4 @@ jobs:
           text: Deployment to production completed.
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        if: always()
+        if: success()

@@ -82,22 +82,60 @@ export default function CampaignEmbed() {
   useEffect(() => {
     const targetOrigin = parentOrigin || '*';
     let lastHeight = 0;
+    let frame = 0;
+
+    const measureHeight = () => {
+      // iOS Safari can under-report <html>.scrollHeight in an iframe, so take
+      // the largest of the documentElement / body heights and track images.
+      const doc = document.documentElement;
+      const body = document.body;
+      const heights = [doc && doc.scrollHeight, doc && doc.offsetHeight, body && body.scrollHeight];
+      return Math.max(0, ...heights.filter(Number.isFinite));
+    };
 
     const notifyHeight = () => {
-      const height = document.documentElement.scrollHeight;
+      const height = measureHeight();
       if (height !== lastHeight) {
         lastHeight = height;
         window.parent.postMessage({ type: 'resize', height }, targetOrigin);
       }
     };
 
+    // Coalesce bursty layout changes (images, fonts) into a single frame so we
+    // only push one resize per paint rather than spamming the parent.
+    const scheduleNotify = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(notifyHeight);
+    };
+
     notifyHeight();
 
-    const observer = new ResizeObserver(notifyHeight);
-    observer.observe(document.documentElement);
+    let observer;
+    if (typeof ResizeObserver !== 'undefined') {
+      // Height is already deduped, so respond immediately to observed layout
+      // changes rather than deferring through a rAF tick.
+      observer = new ResizeObserver(notifyHeight);
+      observer.observe(document.documentElement);
+      if (document.body) observer.observe(document.body);
+    }
+
+    // Mobile Safari can skip ResizeObserver for late layout changes, so also
+    // react to window resizes, webfont loads, and image loads.
+    window.addEventListener('resize', scheduleNotify);
+    window.addEventListener('load', scheduleNotify);
+
+    document.fonts?.ready?.then(scheduleNotify).catch(() => {});
+
+    // Catch any remaining late-height drift (e.g. async content) after a tick.
+    frame = window.requestAnimationFrame(() => {
+      setTimeout(scheduleNotify, 50);
+    });
 
     return () => {
-      observer.disconnect();
+      if (observer) observer.disconnect();
+      window.removeEventListener('resize', scheduleNotify);
+      window.removeEventListener('load', scheduleNotify);
+      if (frame) window.cancelAnimationFrame(frame);
     };
   }, [campaign, loading, error, parentOrigin]);
 
