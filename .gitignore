@@ -29,6 +29,9 @@ Thumbs.db
 *.log
 npm-debug.log*
 
+# Deploy rollback marker (written by .github/workflows/deploy.yml on the host)
+.previous-deploy-sha
+
 # Agent / tool local config
 .claude/
 .kiro/
