@@ -18,6 +18,8 @@ const {
   verifyEmbedToken,
   validateOrigin,
 } = require('../services/embedTokenJwtService');
+const { evaluateCampaign } = require('../services/fraudService');
+const { createNotification } = require('../services/notifications');
 
 const DESCRIPTION_TRUNCATE_LENGTH = 140;
 
@@ -226,6 +228,66 @@ router.post(
       return res.status(400).json({ error: 'Invalid contribution amount' });
     }
 
+    // ── Fetch campaign for validation before any mutation ─────────────────────
+    const { rows: campaignFetch } = await db.query(
+      `SELECT id, status, deadline, target_amount, raised_amount,
+              min_contribution, max_contribution, creator_id
+       FROM campaigns
+       WHERE id = $1 AND deleted_at IS NULL`,
+      [campaignId]
+    );
+
+    if (campaignFetch.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    const campaign = campaignFetch[0];
+
+    // ── Campaign status check ─────────────────────────────────────────────────
+    if (!['active', 'funded'].includes(campaign.status)) {
+      return res.status(400).json({ error: 'Campaign is not accepting contributions' });
+    }
+
+    // ── Deadline check ────────────────────────────────────────────────────────
+    if (campaign.deadline && new Date(campaign.deadline) < new Date()) {
+      return res.status(400).json({ error: 'Campaign deadline has passed' });
+    }
+
+    // ── Minimum contribution amount ───────────────────────────────────────────
+    const minContrib = campaign.min_contribution ? Number(campaign.min_contribution) : null;
+    if (minContrib !== null && contribAmount < minContrib) {
+      return res.status(400).json({
+        error: `Contribution amount is below the minimum of ${minContrib}`,
+      });
+    }
+
+    // ── Maximum contribution amount ───────────────────────────────────────────
+    const maxContrib = campaign.max_contribution ? Number(campaign.max_contribution) : null;
+    if (maxContrib !== null && contribAmount > maxContrib) {
+      return res.status(400).json({
+        error: `Contribution amount exceeds the maximum of ${maxContrib}`,
+      });
+    }
+
+    // ── Per-contributor IP cap ────────────────────────────────────────────────
+    // Mirror the main contribution flow's max_contribution_per_user check using
+    // the hashed IP as the contributor identity for anonymous embed contributions.
+    if (maxContrib !== null) {
+      const { rows: capCheck } = await db.query(
+        `SELECT COALESCE(SUM(amount), 0)::numeric AS total
+         FROM embed_contributions
+         WHERE campaign_id = $1 AND contributor_ip_hash = $2`,
+        [campaignId, contributorIpHash]
+      );
+      const alreadyContributed = Number(capCheck[0].total);
+      if (alreadyContributed + contribAmount > maxContrib) {
+        return res.status(400).json({
+          error: `This contribution would exceed the per-contributor limit of ${maxContrib}`,
+        });
+      }
+    }
+
+    // ── Atomic update ─────────────────────────────────────────────────────────
     const { rows: campaignRows } = await db.query(
       `UPDATE campaigns
        SET raised_amount = raised_amount + $1
@@ -248,6 +310,19 @@ router.post(
 
     const updated = campaignRows[0];
     const totalRaised = Number(updated.raised_amount);
+
+    // ── Fraud signal evaluation (non-fatal) ───────────────────────────────────
+    evaluateCampaign(campaignId).catch(() => {});
+
+    // ── Notify campaign creator (non-fatal) ───────────────────────────────────
+    if (campaign.creator_id) {
+      createNotification(campaign.creator_id, {
+        type: 'embed_contribution_received',
+        title: 'New contribution via embed widget',
+        body: `A contribution of ${contribAmount} ${asset} was received through your embed widget.`,
+        link: `/campaigns/${campaignId}`,
+      }).catch(() => {});
+    }
 
     res.json({
       success: true,
