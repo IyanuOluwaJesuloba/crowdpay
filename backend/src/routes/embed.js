@@ -176,6 +176,7 @@ router.get(
   authenticateEmbedToken,
   asyncHandler(async (req, res) => {
     const { campaignId } = req.params;
+    res.header('Access-Control-Allow-Origin', '*');
     const { rows } = await db.query(
       `SELECT title, description, target_amount, raised_amount, asset_type, status, deadline
        FROM campaigns WHERE id = $1 AND deleted_at IS NULL`,
@@ -196,6 +197,26 @@ router.get(
     const totalRaised = Number(campaign.raised_amount) || 0;
     const percentFunded = goal > 0 ? Math.min(100, Math.round((totalRaised / goal) * 1000) / 10) : 0;
 
+    const { rows: milestoneRows } = await db.query(
+      `SELECT
+         COUNT(*)::int AS total,
+         COUNT(completed_at)::int AS completed
+       FROM campaign_milestones
+       WHERE campaign_id = $1 AND deleted_at IS NULL`,
+      [campaignId]
+    );
+
+    const { rows: settingsRows } = await db.query(
+      `SELECT brand_color, accent_color
+       FROM campaign_settings
+       WHERE campaign_id = $1`,
+      [campaignId]
+    );
+
+    const milestoneTotal = milestoneRows[0]?.total || 0;
+    const milestoneCompleted = milestoneRows[0]?.completed || 0;
+    const milestonePercent = milestoneTotal > 0 ? Math.round((milestoneCompleted / milestoneTotal) * 100) : 0;
+
     // Strict schema check: returns zero internal fields (no wallet keys, no email, no IDs)
     res.json({
       title: campaign.title,
@@ -207,6 +228,15 @@ router.get(
       asset: campaign.asset_type,
       status: campaign.status,
       contributorCount: countRows[0]?.count || 0,
+      milestoneProgress: {
+        total: milestoneTotal,
+        completed: milestoneCompleted,
+        percent: milestonePercent,
+      },
+      branding: {
+        brandColor: settingsRows[0]?.brand_color || '#2563eb',
+        accentColor: settingsRows[0]?.accent_color || '#f59e0b',
+      },
     });
   })
 );
@@ -380,6 +410,25 @@ router.get(
     }
 
     res.send(`<!DOCTYPE html><html><head><title>CrowdPay Widget</title></head><body>Embed Widget</body></html>`);
+  }
+);
+
+/**
+ * GET /embed/widget.js (or /widget.js)
+ * Serves the script-tag embed loader for the milestone progress bar widget.
+ */
+router.get(
+  ['/widget.js', '/embed/widget.js'],
+  (req, res) => {
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const widgetScriptPath = path.join(__dirname, '../../../frontend/public/embed/widget.js');
+    if (fs.existsSync(widgetScriptPath)) {
+      return res.sendFile(widgetScriptPath);
+    }
+
+    res.send(`(function(){var s=document.currentScript,u=new URL(s.src);u.pathname='/widget.html';var i=document.createElement('iframe');i.src=u.toString();i.style.width='100%';i.style.border='0';i.style.overflow='hidden';s.parentNode.insertBefore(i,s);setInterval(function(){u.searchParams.set('_t',Date.now());i.src=u.toString();},60000);})();`);
   }
 );
 

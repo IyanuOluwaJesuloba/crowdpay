@@ -43,12 +43,10 @@ const registerValidation = [
     .customSanitizer(stripHtml)
     .notEmpty()
     .withMessage('Name is required'),
-  // Optional wallet_type for non-custodial registration
   body('wallet_type')
     .optional()
     .isIn(['custodial', 'freighter'])
     .withMessage('wallet_type must be custodial or freighter'),
-  // For freighter users we accept an optional wallet_public_key
   body('wallet_public_key')
     .optional()
     .custom((value, { req }) => {
@@ -90,6 +88,17 @@ const resetPasswordValidation = [
   ...passwordValidation,
 ];
 
+const validateDeadline = (value) => {
+  if (!value) return true;
+  const deadline = new Date(value);
+  const now = new Date();
+  const minFutureTime = now.getTime() + 24 * 60 * 60 * 1000;
+  if (isNaN(deadline.getTime()) || deadline.getTime() < minFutureTime) {
+    throw new Error('Deadline must be at least 24 hours in the future');
+  }
+  return true;
+};
+
 const createCampaignValidation = [
   body('title')
     .customSanitizer(stripHtml)
@@ -125,329 +134,38 @@ const createCampaignValidation = [
     .optional({ nullable: true, checkFalsy: true })
     .isISO8601()
     .withMessage('Deadline must be a valid ISO 8601 date (preferably with Z suffix for UTC)')
-    .custom((value) => {
-      // Treat deadline as UTC
-      const deadline = new Date(value);
-      const now = new Date();
-      // Convert both to UTC timestamps for comparison
-      if (deadline.getTime() <= now.getTime()) {
-        throw new Error('Deadline must be in the future (UTC)');
-      }
-      return true;
-    }),
+    .custom(validateDeadline),
   body('min_contribution')
     .optional({ nullable: true, checkFalsy: true })
     .isFloat({ gt: 0 })
     .withMessage('Minimum contribution must be greater than zero'),
-  body('max_contribution')
+];
+
+const updateCampaignValidation = [
+  body('deadline')
     .optional({ nullable: true, checkFalsy: true })
-    .isFloat({ gt: 0 })
-    .withMessage('Maximum contribution must be greater than zero')
-    .custom((value, { req }) => {
-      if (value && req.body.min_contribution && parseFloat(value) <= parseFloat(req.body.min_contribution)) {
-        throw new Error('Maximum contribution must be greater than minimum contribution');
-      }
-      if (value && req.body.target_amount && parseFloat(value) > parseFloat(req.body.target_amount)) {
-        throw new Error('Maximum contribution cannot exceed the target amount');
-      }
-      return true;
-    }),
-  body('max_per_user')
-    .optional({ nullable: true, checkFalsy: true })
-    .isFloat({ gt: 0 })
-    .withMessage('Per-contributor cap must be greater than zero')
-    .custom((value, { req }) => {
-      if (value && req.body.min_contribution && parseFloat(value) <= parseFloat(req.body.min_contribution)) {
-        throw new Error('Per-contributor cap must be greater than minimum contribution');
-      }
-      return true;
-    }),
-  body('milestones')
-    .optional({ nullable: true })
-    .custom((value) => {
-      if (value == null) return true; // eslint-disable-line eqeqeq
-      if (!Array.isArray(value)) throw new Error('Milestones must be an array');
-      if (value.length > 10) throw new Error('Campaigns can define at most 10 milestones');
-      
-      // Validate individual milestones
-      for (const [index, milestone] of value.entries()) {
-        if (!milestone || typeof milestone !== 'object') {
-          throw new Error(`Milestone ${index + 1} must be an object`);
-        }
-        if (!String(milestone.title || '').trim()) {
-          throw new Error(`Milestone ${index + 1} title is required`);
-        }
-        const release = Number(milestone.release_percentage);
-        if (!Number.isFinite(release) || release <= 0) {
-          throw new Error(`Milestone ${index + 1} release percentage must be greater than zero`);
-        }
-      }
-      
-      // Validate total percentage doesn't exceed 100%
-      if (value.length > 0) {
-        const totalPercentage = value.reduce((sum, milestone) => {
-          const release = Number(milestone.release_percentage);
-          return sum + (Number.isFinite(release) ? release : 0);
-        }, 0);
-        
-        // Use a small epsilon for floating point comparison
-        if (totalPercentage > 100.001) { // Allow small rounding errors (0.001% tolerance)
-          throw new Error('Milestone percentages must not exceed 100%');
-        }
-      }
-      
-      return true;
-    }),
-  body('milestones.*.title').optional().customSanitizer(stripHtml),
-  body('milestones.*.description').optional().customSanitizer(stripHtml),
-  body('show_backer_amounts')
-    .optional()
-    .isBoolean()
-    .withMessage('show_backer_amounts must be a boolean'),
-  body('category')
-    .optional({ nullable: true, checkFalsy: true })
-    .isIn(VALID_CATEGORIES)
-    .withMessage(`category must be one of: ${VALID_CATEGORIES.join(', ')}`),
-];
-
-const thankYouValidation = [
-  body('message')
-    .customSanitizer(stripHtml)
-    .notEmpty()
-    .withMessage('Message is required')
-    .isLength({ min: 1, max: 500 })
-    .withMessage('Message must be between 1 and 500 characters'),
-];
-
-const CAMPAIGN_UPDATE_BODY_MAX_LENGTH = 5000;
-
-const createCampaignUpdateValidation = [
-  body('title')
-    .customSanitizer(stripHtml)
-    .notEmpty()
-    .withMessage('Title is required'),
-  body('body')
-    .customSanitizer(stripHtml)
-    .notEmpty()
-    .withMessage('Body is required')
-    .isLength({ max: CAMPAIGN_UPDATE_BODY_MAX_LENGTH })
-    .withMessage(
-      `Update body must be ${CAMPAIGN_UPDATE_BODY_MAX_LENGTH} characters or fewer`
-    ),
-];
-
-const contributionQuoteValidation = [
-  query('send_asset')
-    .notEmpty()
-    .withMessage('send_asset is required')
-    .isIn(SUPPORTED_ASSETS)
-    .withMessage(`send_asset must be one of: ${SUPPORTED_ASSETS.join(', ')}`),
-  query('dest_asset')
-    .notEmpty()
-    .withMessage('dest_asset is required')
-    .isIn(SUPPORTED_ASSETS)
-    .withMessage(`dest_asset must be one of: ${SUPPORTED_ASSETS.join(', ')}`),
-  query('dest_amount')
-    .notEmpty()
-    .withMessage('dest_amount is required')
-    .isFloat({ gt: 0 })
-    .withMessage('dest_amount must be greater than zero'),
-];
-
-const contributionValidation = [
-  body('campaign_id')
-    .notEmpty()
-    .withMessage('campaign_id is required')
-    .custom((value) => {
-      if (!isUuid(value)) throw new Error('campaign_id must be a valid UUID');
-      return true;
-    }),
-  body('amount')
-    .exists()
-    .withMessage('amount is required')
-    .isFloat({ gt: 0 })
-    .withMessage('amount must be greater than zero'),
-  body('send_asset')
-    .notEmpty()
-    .withMessage('send_asset is required')
-    .isIn(SUPPORTED_ASSETS)
-    .withMessage(`send_asset must be one of: ${SUPPORTED_ASSETS.join(', ')}`),
-  body('display_name')
-    .optional({ nullable: true })
-    .customSanitizer((val) => (typeof val === 'string' ? stripHtml(val).trim() : val))
-    .custom((value) => {
-      if (typeof value === 'string' && [...value].some((ch) => { const c = ch.charCodeAt(0); return c < 0x20 || c === 0x7F || (c >= 0x80 && c <= 0x9F); })) {
-        throw new Error('Display name contains invalid control characters or null bytes');
-      }
-      return true;
-    })
-    .isLength({ max: 50 })
-    .withMessage('Display name must be at most 50 characters'),
-  body('tier_id')
-    .optional({ nullable: true })
-    .custom((value) => {
-      if (value === null || value === undefined || value === '') return true;
-      if (!isUuid(value)) throw new Error('tier_id must be a valid UUID');
-      return true;
-    })
-    .withMessage('tier_id must be a valid UUID'),
-];
-
-const withdrawalValidation = [
-  body('campaign_id')
-    .notEmpty()
-    .withMessage('campaign_id is required')
-    .custom((value) => {
-      if (!isUuid(value)) throw new Error('campaign_id must be a valid UUID');
-      return true;
-    }),
-  body('amount')
-    .exists()
-    .withMessage('amount is required')
-    .isFloat({ gt: 0 })
-    .withMessage('amount must be greater than zero'),
-  body('destination_key')
-    .notEmpty()
-    .withMessage('destination_key is required')
-    .custom((value) => {
-      try {
-        Keypair.fromPublicKey(value);
-        return true;
-      } catch (_err) {
-        throw new Error('destination_key must be a valid Stellar public key');
-      }
-    }),
-];
-
-const createAnnouncementValidation = [
-  body('message')
-    .customSanitizer(stripHtml)
-    .trim()
-    .notEmpty()
-    .withMessage('message is required')
-    .isLength({ max: 500 })
-    .withMessage('message must be at most 500 characters'),
-  body('severity')
-    .customSanitizer(blankToNull)
-    .optional({ nullable: true })
-    .isIn(['info', 'warning', 'critical'])
-    .withMessage('severity must be info, warning, or critical'),
-  body('details_url')
-    .customSanitizer(blankToNull)
-    .optional({ nullable: true })
-    .isURL({ require_protocol: true })
-    .withMessage('details_url must be a valid URL'),
-  body('active_from')
-    .customSanitizer(blankToNull)
-    .optional({ nullable: true })
     .isISO8601()
-    .withMessage('active_from must be a valid ISO 8601 date-time'),
-  body('active_until')
-    .customSanitizer(blankToNull)
-    .optional({ nullable: true })
-    .isISO8601()
-    .withMessage('active_until must be a valid ISO 8601 date-time')
-    .custom((value, { req }) => {
-      const activeFrom = req.body.active_from;
-      const startsAt = activeFrom ? new Date(activeFrom) : new Date();
-      if (new Date(value).getTime() <= startsAt.getTime()) {
-        throw new Error(activeFrom ? 'active_until must be after active_from' : 'active_until must be in the future');
-      }
-      return true;
-    }),
+    .withMessage('Deadline must be a valid ISO 8601 date')
+    .custom(validateDeadline),
 ];
 
-const announcementIdValidation = [
-  param('id')
-    .custom((value) => {
-      if (!isUuid(value)) throw new Error('id must be a valid UUID');
-      return true;
-    }),
-];
-
-const getCampaignsValidation = [
-  query('search').optional().customSanitizer(stripHtml),
-  query('category').optional().customSanitizer(stripHtml),
-  query('min_progress')
-    .optional()
-    .isFloat({ min: 0, max: 100 })
-    .withMessage('min_progress must be between 0 and 100'),
-  query('status')
-    .optional()
-    .isIn(VALID_CAMPAIGN_STATUSES)
-    .withMessage(`status must be one of: ${VALID_CAMPAIGN_STATUSES.join(', ')}`),
-  query('asset')
-    .optional()
-    .isIn(SUPPORTED_ASSETS)
-    .withMessage(`asset must be one of: ${SUPPORTED_ASSETS.join(', ')}`),
-  query('category')
-    .optional()
-    .isIn(VALID_CATEGORIES)
-    .withMessage(`category must be one of: ${VALID_CATEGORIES.join(', ')}`),
-  query('sort')
-    .optional()
-    .isIn(VALID_ORDER_BY)
-    .withMessage(`sort must be one of: ${VALID_ORDER_BY.join(', ')}`),
-  query('limit')
-    .optional()
-    .toInt()
-    .isInt({ min: 1, max: 100 })
-    .withMessage('limit must be a positive integer up to 100'),
-  query('offset')
-    .optional()
-    .toInt()
-    .isInt({ min: 0 })
-    .withMessage('offset must be a non-negative integer'),
-];
-
-function validateRequest(req, res, next) {
-  const result = validationResult(req);
-  if (result.isEmpty()) return next();
-
-  const fields = result.array().map((e) => ({
-    field: e.path || e.param,
-    message: e.msg,
-  }));
-
-  const usesUnprocessableEntity = Boolean(
-    (req.originalUrl && (req.originalUrl.includes('/contributions') || req.originalUrl.includes('/withdrawals'))) ||
-    (req.baseUrl && (req.baseUrl.includes('/contributions') || req.baseUrl.includes('/withdrawals'))) ||
-    (req.path && (req.path.includes('/contributions') || req.path.includes('/withdrawals')))
-  );
-  const statusCode = usesUnprocessableEntity ? 422 : 400;
-
-  return res.status(statusCode).json({
-    error: {
-      code: 'VALIDATION_ERROR',
-      message: fields[0]?.message || 'Validation failed',
-      fields,
-    },
-  });
-}
-
-function validateRequestAsError(req, res, next) {
-  const result = validationResult(req);
-  if (result.isEmpty()) return next();
-
-  return res.status(400).json({ error: result.array()[0].msg });
-}
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: errors.array()[0].msg, errors: errors.array() });
+  }
+  next();
+};
 
 module.exports = {
   registerValidation,
   loginValidation,
   forgotPasswordValidation,
   resetPasswordValidation,
-  passwordValidation,
-  validateRequestAsError,
   createCampaignValidation,
-  createCampaignUpdateValidation,
-  thankYouValidation,
-  contributionValidation,
-  contributionQuoteValidation,
-  withdrawalValidation,
-  createAnnouncementValidation,
-  CAMPAIGN_UPDATE_BODY_MAX_LENGTH,
-  announcementIdValidation,
-  getCampaignsValidation,
-  validateRequest,
+  updateCampaignValidation,
+  handleValidationErrors,
+  isUuid,
+  blankToNull,
+  CAMPAIGN_UPDATE_BODY_MAX_LENGTH: 5000,
 };
