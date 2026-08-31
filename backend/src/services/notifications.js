@@ -51,8 +51,10 @@ async function loadPreferences(userId, eventType) {
 // it has a destination configured and the user has not explicitly disabled it
 // for this event type.
 function channelEnabled(channel, prefs, settings) {
-  if (channel === 'push' && settings?.push_enabled) {
-    return prefs.push === undefined ? true : prefs.push === true;
+  if (channel === 'push') {
+    if (!settings?.push_enabled) return false;
+    const override = prefs.push;
+    return override === undefined ? true : override === true;
   }
   if (!channels.destinationFor(channel, settings)) return false;
   const override = prefs[channel];
@@ -110,271 +112,86 @@ async function createNotification(userId, { type, title, body, link }, { nowHour
     await insertInApp(userId, message);
   } catch (err) {
     logger.error('Failed to create notification', { user_id: userId, type, error: err.message });
-    // In-app is the baseline record; if it fails we still attempt external
-    // channels below so a transient DB error doesn't silently drop alerts.
   }
 
-  let settings;
-  let prefs;
   try {
-    [settings, prefs] = await Promise.all([
-      loadChannelSettings(userId),
-      loadPreferences(userId, type),
-    ]);
-  } catch (err) {
-    logger.error('Failed to load notification settings', { user_id: userId, type, error: err.message });
-    return;
-  }
+    const settings = await loadChannelSettings(userId);
+    if (!settings) return;
 
-  if (!settings) return; // No external channels configured.
+    const prefs = await loadPreferences(userId, type);
+    const hour = nowHour !== undefined ? nowHour : new Date().getHours();
+    const quiet = inQuietHours(settings, hour) && !channels.isCriticalEvent(type);
 
-  const externalChannels = channels.CHANNELS.filter((c) => c !== 'in_app');
-  const critical = channels.isCriticalEvent(type);
-  const currentHour = typeof nowHour === 'number' ? nowHour : new Date().getHours();
-  const quiet = !critical && inQuietHours(settings, currentHour);
+    for (const channel of channels.CHANNELS) {
+      if (channel === 'in_app') continue;
+      if (!channelEnabled(channel, prefs, settings)) continue;
 
-  for (const channel of externalChannels) {
-    if (!channelEnabled(channel, prefs, settings)) continue;
-
-    if (quiet) {
-      try {
+      if (quiet) {
         await queueForDigest(userId, channel, message);
-      } catch (err) {
-        logger.error('Failed to queue notification for digest', {
-          user_id: userId, channel, type, error: err.message,
-        });
+      } else {
+        await deliverChannel(userId, channel, settings, message);
       }
-      continue;
     }
-
-    await deliverChannel(userId, channel, settings, message);
+  } catch (err) {
+    logger.error('Notification channel fan-out failed', { user_id: userId, type, error: err.message });
   }
 }
 
 /**
- * Flush notifications parked during quiet hours. For each user/channel with
- * pending items, delivers a single digest message summarising them and marks
- * the rows flushed. Intended to be run on a schedule (e.g. hourly cron).
- *
- * @param {number} [nowHour] Current local hour (0-23); injectable for testing.
- * @returns {Promise<number>} number of users flushed
+ * Fan a notification out to a batch of user IDs efficiently.
  */
-async function flushQuietHours({ nowHour } = {}) {
-  const currentHour = typeof nowHour === 'number' ? nowHour : new Date().getHours();
+async function createNotificationsBulk(userIds, message, options = {}) {
+  if (!Array.isArray(userIds) || !userIds.length) return;
+  await Promise.all(userIds.map((userId) => createNotification(userId, message, options)));
+}
 
-  const { rows: pending } = await db.query(
+async function flushQuietHours(nowHour = new Date().getHours()) {
+  const { rows } = await db.query(
     `SELECT q.id, q.user_id, q.channel, q.type, q.title, q.body, q.link,
             s.push_token, s.slack_webhook_url, s.discord_webhook_url, s.sms_phone_number,
-            s.quiet_hours_start, s.quiet_hours_end
+            s.quiet_hours_start, s.quiet_hours_end,
+            EXISTS (SELECT 1 FROM push_subscriptions WHERE user_id = q.user_id) AS push_enabled
      FROM notification_queue q
      JOIN notification_channel_settings s ON s.user_id = q.user_id
      WHERE q.flushed_at IS NULL
-     ORDER BY q.user_id, q.channel, q.created_at ASC`
+     ORDER BY q.created_at ASC
+     LIMIT 200`
   );
 
-  // Group pending items by user+channel, skipping users still in quiet hours.
-  const groups = new Map();
-  for (const row of pending) {
-    if (inQuietHours(row, currentHour)) continue;
-    const key = `${row.user_id}:${row.channel}`;
-    if (!groups.has(key)) {
-      groups.set(key, { settings: row, channel: row.channel, items: [] });
-    }
-    groups.get(key).items.push(row);
-  }
+  for (const row of rows) {
+    if (inQuietHours(row, nowHour)) continue;
 
-  const flushedUsers = new Set();
-  for (const { settings, channel, items } of groups.values()) {
-    const digest = {
-      type: 'digest',
-      title: `You have ${items.length} new notification${items.length === 1 ? '' : 's'}`,
-      body: items.map((i) => i.title).join('\n'),
-      link: null,
+    const settings = {
+      push_token: row.push_token,
+      push_enabled: row.push_enabled,
+      slack_webhook_url: row.slack_webhook_url,
+      discord_webhook_url: row.discord_webhook_url,
+      sms_phone_number: row.sms_phone_number,
     };
 
-    const delivered = await deliverChannel(settings.user_id, channel, settings, digest);
-    if (delivered) {
-      const ids = items.map((i) => i.id);
-      await db.query(
-        `UPDATE notification_queue SET flushed_at = NOW() WHERE id = ANY($1::uuid[])`,
-        [ids]
-      );
-      flushedUsers.add(settings.user_id);
-    }
-  }
+    const message = {
+      type: row.type,
+      title: row.title,
+      body: row.body,
+      link: row.link,
+    };
 
-  return flushedUsers.size;
-}
-
-/**
- * Create in-app notifications for multiple users in a single multi-row INSERT.
- */
-async function insertInAppBulk(userIds, { type, title, body, link }) {
-  if (!userIds.length) return;
-  const placeholders = userIds.map((_, i) => `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5})`);
-  const values = userIds.flatMap((uid) => [uid, type, title, body || null, link || null]);
-  await db.query(
-    `INSERT INTO notifications (user_id, type, title, body, link) VALUES ${placeholders.join(', ')}`,
-    values
-  );
-}
-
-/**
- * Bulk-load channel settings for many users at once.
- */
-async function loadChannelSettingsBulk(userIds) {
-  if (!userIds.length) return new Map();
-  const { rows } = await db.query(
-    `SELECT user_id, push_token, slack_webhook_url, discord_webhook_url, sms_phone_number,
-            quiet_hours_start, quiet_hours_end,
-            EXISTS (SELECT 1 FROM push_subscriptions WHERE user_id = notification_channel_settings.user_id) AS push_enabled
-     FROM notification_channel_settings
-     WHERE user_id = ANY($1::uuid[])`,
-    [userIds]
-  );
-  const map = new Map();
-  for (const r of rows) map.set(r.user_id, r);
-  return map;
-}
-
-/**
- * Bulk-load notification preferences for many users and a single event type.
- * Returns Map<user_id, Map<channel, enabled>>.
- */
-async function loadPreferencesBulk(userIds, eventType) {
-  if (!userIds.length) return new Map();
-  const { rows } = await db.query(
-    `SELECT user_id, channel, enabled
-     FROM notification_preferences
-     WHERE user_id = ANY($1::uuid[]) AND event_type = $2`,
-    [userIds, eventType]
-  );
-  const map = new Map();
-  for (const r of rows) {
-    if (!map.has(r.user_id)) map.set(r.user_id, {});
-    map.get(r.user_id)[r.channel] = r.enabled;
-  }
-  return map;
-}
-
-/**
- * Queue multiple digest entries in a single multi-row INSERT.
- */
-async function queueForDigestBulk(userChannelEntries, message) {
-  if (!userChannelEntries.length) return;
-  const placeholders = userChannelEntries.map((_, i) => `($${i * 6 + 1}, $${i * 6 + 2}, $${i * 6 + 3}, $${i * 6 + 4}, $${i * 6 + 5}, $${i * 6 + 6})`);
-  const values = userChannelEntries.flatMap(({ userId, channel }) =>
-    [userId, channel, message.type, message.title, message.body || null, message.link || null]
-  );
-  await db.query(
-    `INSERT INTO notification_queue (user_id, channel, type, title, body, link) VALUES ${placeholders.join(', ')}`,
-    values
-  );
-}
-
-/**
- * Fan out a notification to many users, batching DB operations and limiting
- * external channel delivery concurrency to avoid connection-pool exhaustion.
- *
- * @param {string[]} userIds
- * @param {{type, title, body?, link?}} message
- * @param {object} [opts]
- * @param {number} [opts.concurrency=10]  Max concurrent external deliveries
- * @param {number} [opts.nowHour]         Injectable for testing
- */
-async function createNotificationsBulk(userIds, message, { concurrency = 10, nowHour } = {}) {
-  if (!userIds.length) return;
-
-  // 1. Batch in-app notification inserts
-  try {
-    await insertInAppBulk(userIds, message);
-  } catch (err) {
-    logger.error('Failed to bulk-create in-app notifications', { type: message.type, count: userIds.length, error: err.message });
-  }
-
-  // 2. Bulk-load settings and preferences
-  let settingsMap;
-  let prefsMap;
-  try {
-    [settingsMap, prefsMap] = await Promise.all([
-      loadChannelSettingsBulk(userIds),
-      loadPreferencesBulk(userIds, message.type),
-    ]);
-  } catch (err) {
-    logger.error('Failed to bulk-load notification settings', { type: message.type, count: userIds.length, error: err.message });
-    return;
-  }
-
-  // 3. Partition users by what to do
-  const critical = channels.isCriticalEvent(message.type);
-  const currentHour = typeof nowHour === 'number' ? nowHour : new Date().getHours();
-  const externalChannels = channels.CHANNELS.filter((c) => c !== 'in_app');
-  const toDeliver = [];
-  const toQueue = [];
-
-  for (const userId of userIds) {
-    const settings = settingsMap.get(userId);
-    if (!settings) continue;
-
-    const prefs = prefsMap.get(userId) || {};
-    const quiet = !critical && inQuietHours(settings, currentHour);
-
-    for (const channel of externalChannels) {
-      if (!channelEnabled(channel, prefs, settings)) continue;
-      if (quiet) {
-        toQueue.push({ userId, channel });
-      } else {
-        toDeliver.push({ userId, channel, settings });
-      }
-    }
-  }
-
-  // 4. Batch queue digest entries
-  if (toQueue.length) {
     try {
-      await queueForDigestBulk(toQueue, message);
+      await deliverChannel(row.user_id, row.channel, settings, message);
     } catch (err) {
-      logger.error('Failed to bulk-queue notifications for digest', { type: message.type, count: toQueue.length, error: err.message });
+      logger.error('Failed to flush queued notification', { queue_id: row.id, error: err.message });
     }
-  }
 
-  // 5. Deliver external channels with bounded concurrency
-  if (toDeliver.length) {
-    const results = await asyncPool(concurrency, toDeliver, async ({ userId, channel, settings }) => {
-      try {
-        await deliverChannel(userId, channel, settings, message);
-      } catch (err) {
-        logger.error('Bulk notification delivery failed', { user_id: userId, channel, type: message.type, error: err.message });
-      }
-    });
+    await db.query('UPDATE notification_queue SET flushed_at = NOW() WHERE id = $1', [row.id]);
   }
-}
-
-/**
- * Simple async pool — run an async function over items with bounded concurrency.
- */
-async function asyncPool(concurrency, items, fn) {
-  const results = [];
-  const executing = new Set();
-  for (const item of items) {
-    const p = Promise.resolve().then(() => fn(item)).then((r) => {
-      executing.delete(p);
-      return r;
-    });
-    executing.add(p);
-    results.push(p);
-    if (executing.size >= concurrency) {
-      await Promise.race(executing);
-    }
-  }
-  return Promise.all(results);
 }
 
 module.exports = {
   createNotification,
   createNotificationsBulk,
   flushQuietHours,
-  // exported for testing / reuse
-  inQuietHours,
+  loadChannelSettings,
+  loadPreferences,
   channelEnabled,
+  inQuietHours,
 };
