@@ -27,9 +27,26 @@ jobs:
 
             set -euo pipefail
             cd "$DEPLOY_PATH"
-            git fetch origin main
+
+            # Record current HEAD before any changes — used by the rollback step.
             git rev-parse HEAD > .previous-deploy-sha
-            git reset --hard origin/main
+            echo "Pre-deploy SHA: $(cat .previous-deploy-sha)"
+
+            # Preserve any local modifications (no-op on a clean tree).
+            git stash --include-untracked
+
+            git fetch origin main
+
+            # --ff-only refuses to proceed if the local branch has diverged
+            # (e.g. a force-push landed or a local commit exists), failing
+            # explicitly instead of silently overwriting local state.
+            git checkout main
+            git pull --ff-only origin main || {
+              echo "ERROR: Fast-forward failed — local branch has diverged from origin/main."
+              echo "Manual intervention required. Restoring stashed changes."
+              git stash pop || true
+              exit 1
+            }
 
             printf '%s\n' "NODE_ENV=production" \
             "DATABASE_URL=${DATABASE_URL}" \
