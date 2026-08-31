@@ -8,14 +8,18 @@ function getJwtSecret() {
 
 /**
  * Signs a JWT for an embed token.
- * Payload includes sub (campaignId) and origins (allowedOrigins).
+ * Payload includes sub (campaignId), origins (allowedOrigins), and optionally scope.
  * expiresIn can be '7d', '30d', or 'never'.
  */
-function signEmbedToken({ campaignId, allowedOrigins = [], expiresIn = 'never' }) {
+function signEmbedToken({ campaignId, allowedOrigins = [], expiresIn = 'never', scope = null }) {
   const payload = {
     sub: campaignId,
     origins: Array.isArray(allowedOrigins) ? allowedOrigins : [],
   };
+
+  if (scope) {
+    payload.scope = scope;
+  }
 
   const options = {};
   if (expiresIn === '7d') {
@@ -60,8 +64,22 @@ function validateOrigin(originHeader, allowedOrigins = []) {
   });
 }
 
+/**
+ * Signs a JWT for a milestone progress widget embed token.
+ * This token is scoped to read-only milestone access for external embedding.
+ */
+function signMilestoneWidgetToken({ campaignId, allowedOrigins = [], expiresIn = 'never' }) {
+  return signEmbedToken({
+    campaignId,
+    allowedOrigins,
+    expiresIn,
+    scope: 'milestones:read',
+  });
+}
+
 module.exports = {
   signEmbedToken,
   verifyEmbedToken,
   validateOrigin,
+  signMilestoneWidgetToken,
 };
