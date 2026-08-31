@@ -23,6 +23,31 @@ const { createNotification } = require('../services/notifications');
 
 const DESCRIPTION_TRUNCATE_LENGTH = 140;
 
+/**
+ * Build the Content-Security-Policy for the embed widget from environment
+ * variables so dev/staging/self-hosted deployments work without hardcoding
+ * api.crowdpay.com. The WebSocket protocol is derived from the backend URL
+ * and localhost origins are only permitted in non-production environments.
+ */
+function buildEmbedCsp() {
+  const backendUrl = new URL(process.env.BACKEND_URL || 'http://localhost:3001');
+  const wsProtocol = backendUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+
+  const connectSrc = [backendUrl.host, `${wsProtocol}//${backendUrl.host}`];
+
+  if (process.env.NODE_ENV !== 'production') {
+    connectSrc.push('http://localhost:3001', 'ws://localhost:3001');
+  }
+
+  return (
+    `frame-ancestors *; ` +
+    `default-src 'self'; ` +
+    `connect-src ${connectSrc.join(' ')}; ` +
+    `script-src 'self'; ` +
+    `style-src 'self'`
+  );
+}
+
 function truncateDescription(description) {
   if (!description) return '';
   return description.length > DESCRIPTION_TRUNCATE_LENGTH
@@ -342,18 +367,14 @@ router.get(
   ['/widget.html', '/widget'],
   (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader(
-      'Content-Security-Policy',
-      "frame-ancestors *; default-src 'self'; connect-src api.crowdpay.com wss://api.crowdpay.com http://localhost:3001 ws://localhost:3001; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
-    );
+    res.setHeader('Content-Security-Policy', buildEmbedCsp());
     res.removeHeader('X-Frame-Options');
 
     const widgetPath = path.join(__dirname, '../../../frontend/public/embed/widget.html');
     if (fs.existsSync(widgetPath)) {
       return res.sendFile(widgetPath, {
         headers: {
-          'Content-Security-Policy':
-            "frame-ancestors *; default-src 'self'; connect-src api.crowdpay.com wss://api.crowdpay.com http://localhost:3001 ws://localhost:3001; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+          'Content-Security-Policy': buildEmbedCsp(),
         },
       });
     }

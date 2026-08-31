@@ -5,6 +5,10 @@ const {
   getProposalById,
   checkUserTokenBalance,
   getUserTokenBalance,
+  getEffectiveVoteWeight,
+  setVoteDelegation,
+  revokeVoteDelegation,
+  getDelegateForWallet,
   createProposal,
   voteOnProposal,
   executeProposal,
@@ -232,6 +236,86 @@ router.post('/sync', async (req, res, next) => {
     res.json({ success: true, message: 'Proposal data synced' });
   } catch (error) {
     logger.error('Failed to sync proposal data', { error: error.message });
+    next(error);
+  }
+});
+
+/**
+ * GET /api/governance/user/vote-weight
+ * Get the current user's effective vote weight, including delegated power (#735).
+ */
+router.get('/user/vote-weight', requireAuth, async (req, res, next) => {
+  try {
+    const publicKey = req.user.wallet_public_key;
+    const [weight, delegate] = await Promise.all([
+      getEffectiveVoteWeight(publicKey),
+      getDelegateForWallet(publicKey),
+    ]);
+
+    res.json({
+      effective_vote_weight: weight,
+      own_balance: await getUserTokenBalance(publicKey),
+      delegate_public_key: delegate ? delegate.delegate_public_key : null,
+    });
+  } catch (error) {
+    logger.error('Failed to get effective vote weight', { error: error.message });
+    next(error);
+  }
+});
+
+/**
+ * GET /api/governance/delegations
+ * Get the current user's active delegation edge (if any).
+ */
+router.get('/delegations', requireAuth, async (req, res, next) => {
+  try {
+    const delegate = await getDelegateForWallet(req.user.wallet_public_key);
+    res.json({ delegation: delegate });
+  } catch (error) {
+    logger.error('Failed to get delegation', { error: error.message });
+    next(error);
+  }
+});
+
+/**
+ * POST /api/governance/delegations
+ * Delegate the current user's governance voting power to another wallet.
+ */
+router.post('/delegations',
+  requireAuth,
+  body('delegate_public_key').isString().notEmpty(),
+  async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const delegation = await setVoteDelegation(
+        req.user.wallet_public_key,
+        req.body.delegate_public_key
+      );
+      res.status(201).json({ success: true, delegation });
+    } catch (error) {
+      if (error.code === 'INVALID_DELEGATION') {
+        return res.status(400).json({ error: error.message });
+      }
+      logger.error('Failed to set delegation', { error: error.message });
+      next(error);
+    }
+  }
+);
+
+/**
+ * DELETE /api/governance/delegations
+ * Revoke the current user's vote delegation.
+ */
+router.delete('/delegations', requireAuth, async (req, res, next) => {
+  try {
+    const removed = await revokeVoteDelegation(req.user.wallet_public_key);
+    res.json({ success: true, revoked: removed });
+  } catch (error) {
+    logger.error('Failed to revoke delegation', { error: error.message });
     next(error);
   }
 });

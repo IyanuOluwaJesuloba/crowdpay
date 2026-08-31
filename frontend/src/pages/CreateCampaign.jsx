@@ -221,6 +221,8 @@ export default function CreateCampaign() {
       template_id: '',
       milestones: [],
       reward_tiers: [],
+      min_reputation_score: 0,
+      required_attestations: [],
     });
     setStep(1);
     setError('');
@@ -567,6 +569,24 @@ export default function CreateCampaign() {
           setError(
             policyError.message ||
               'Campaign created, but the treasury policy could not be saved. Set it in campaign settings.'
+          );
+        }
+      }
+
+      // Save contributor requirements if any were set (#689)
+      const hasRequirements =
+        (form.min_reputation_score > 0) || (form.required_attestations ?? []).length > 0;
+      if (hasRequirements) {
+        try {
+          await api.setCampaignRequirements(campaign.id, {
+            min_reputation_score: form.min_reputation_score ?? 0,
+            required_attestations: form.required_attestations ?? [],
+          });
+        } catch (reqErr) {
+          // Non-fatal: campaign exists, requirements can be set later in settings
+          setError(
+            reqErr.message ||
+              'Campaign created, but contributor requirements could not be saved. Update them in campaign settings.'
           );
         }
       }
@@ -1569,6 +1589,76 @@ export default function CreateCampaign() {
               {form.milestones.length
                 ? ` and ${form.milestones.length} milestone release${form.milestones.length > 1 ? 's' : ''}.`
                 : ' and no milestone plan.'}
+            </div>
+
+            {/* ── Contributor Requirements (#689) ─────────────────────────── */}
+            <div className="campaign-card" style={{ marginTop: '1.25rem' }}>
+              <strong style={{ display: 'block', marginBottom: '0.5rem' }}>
+                Contributor Requirements
+              </strong>
+              <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)', marginBottom: '1rem' }}>
+                Optionally restrict who can contribute to this campaign. Contributors who don&apos;t
+                meet these requirements will be blocked.
+              </p>
+
+              {/* Minimum reputation score */}
+              <label className="label-strong" htmlFor="min_reputation_score">
+                Minimum reputation score (0 = no minimum)
+              </label>
+              <input
+                id="min_reputation_score"
+                type="range"
+                min="0"
+                max="500"
+                step="10"
+                value={form.min_reputation_score ?? 0}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, min_reputation_score: Number(e.target.value) }))
+                }
+                style={{ width: '100%', margin: '0.5rem 0' }}
+              />
+              <div style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)', marginBottom: '1rem' }}>
+                Selected: <strong>{form.min_reputation_score ?? 0}</strong>
+              </div>
+
+              {/* Required attestations */}
+              <label className="label-strong" style={{ display: 'block', marginBottom: '0.5rem' }}>
+                Required KYC attestations
+              </label>
+              {[
+                { value: 'kyc_basic',    label: 'KYC Basic'    },
+                { value: 'kyc_standard', label: 'KYC Standard' },
+                { value: 'kyc_enhanced', label: 'KYC Enhanced' },
+              ].map(({ value, label }) => {
+                const current = form.required_attestations ?? [];
+                const checked = current.includes(value);
+                return (
+                  <label
+                    key={value}
+                    style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.4rem', cursor: 'pointer' }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() =>
+                        setForm((f) => ({
+                          ...f,
+                          required_attestations: checked
+                            ? (f.required_attestations ?? []).filter((a) => a !== value)
+                            : [...(f.required_attestations ?? []), value],
+                        }))
+                      }
+                    />
+                    <span style={{ fontSize: '0.875rem' }}>{label}</span>
+                  </label>
+                );
+              })}
+
+              {((form.min_reputation_score > 0) || (form.required_attestations ?? []).length > 0) && (
+                <div className="alert alert--info" style={{ marginTop: '0.75rem', fontSize: '0.82rem' }}>
+                  Contributors without these requirements will be blocked from contributing to this campaign.
+                </div>
+              )}
             </div>
 
             {error && (

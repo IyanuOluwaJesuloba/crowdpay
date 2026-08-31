@@ -193,7 +193,9 @@ async function getCampaignAnalytics(campaignId) {
     db.query(
       `SELECT COUNT(*)::int                           AS total_contributions,
               COUNT(DISTINCT sender_public_key)::int  AS unique_contributors,
-              COALESCE(AVG(amount), 0)                AS avg_contribution
+              COALESCE(AVG(amount), 0)                AS avg_contribution,
+              SUM(CASE WHEN is_recurring = TRUE THEN 1 ELSE 0 END)::int AS recurring_contributions,
+              COALESCE(SUM(amount) FILTER (WHERE is_recurring = TRUE), 0) AS recurring_total
        FROM contributions
        WHERE campaign_id = $1`,
       [campaignId]
@@ -340,7 +342,9 @@ async function getUserDashboardAnalytics(userId) {
          COALESCE(SUM(ctr.amount), 0)                            AS total_raised,
          COUNT(ctr.id)::int                                       AS total_contributions,
          COUNT(DISTINCT ctr.sender_public_key)::int              AS unique_contributors,
-         COALESCE(AVG(ctr.amount), 0)                            AS avg_contribution
+         COALESCE(AVG(ctr.amount), 0)                            AS avg_contribution,
+         SUM(CASE WHEN ctr.is_recurring = TRUE THEN 1 ELSE 0 END)::int AS recurring_contributions,
+         COALESCE(SUM(ctr.amount) FILTER (WHERE ctr.is_recurring = TRUE), 0) AS recurring_raised
        FROM campaigns c
        LEFT JOIN contributions ctr ON ctr.campaign_id = c.id
        WHERE c.creator_id = $1`,

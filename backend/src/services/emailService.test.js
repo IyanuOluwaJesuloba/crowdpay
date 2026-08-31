@@ -40,6 +40,37 @@ function buildService({ queryImpl } = {}) {
   return { service, sent };
 }
 
+test('sendContributionReceipt uses the CURRENT campaign title after a rename (#733)', async () => {
+  process.env.SMTP_HOST = 'smtp.test';
+  // Simulate the campaign having been renamed: the receipt must read the title
+  // live from the campaigns table instead of a stale snapshot.
+  const { service, sent } = buildService({
+    queryImpl: async (text) => {
+      if (text.includes('SELECT email, name FROM users')) {
+        return { rows: [{ email: 'donor@test.com', name: 'Donor' }] };
+      }
+      if (text.includes('SELECT title FROM campaigns')) {
+        return { rows: [{ title: 'New Title' }] };
+      }
+      return undefined;
+    },
+  });
+
+  await service.sendContributionReceipt({
+    campaignId: 'camp-1',
+    txHash: 'tx-1',
+    amount: '10',
+    asset: 'XLM',
+    senderPublicKey: 'GPK',
+  });
+
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0].subject.includes('New Title'));
+  assert.ok(sent[0].html.includes('New Title'));
+  assert.ok(sent[0].text.includes('New Title'));
+  delete process.env.SMTP_HOST;
+});
+
 test('sendWelcomeEmail sends html and text and is idempotent per recipient', async () => {
   process.env.SMTP_HOST = 'smtp.test';
   const { service, sent } = buildService();

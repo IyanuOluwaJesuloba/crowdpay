@@ -41,6 +41,7 @@ const Governance = lazy(() => import('./pages/Governance'));
 const CampaignShare = lazy(() => import('./pages/CampaignShare'));
 const ReferralDashboard = lazy(() => import('./pages/ReferralDashboard'));
 const OpsCenter = lazy(() => import('./pages/OpsCenter'));
+const ContributorIdentityPage = lazy(() => import('./pages/ContributorIdentityPage'));
 
 function PrivateRoute({ children }) {
   const { user, ready } = useAuth();
@@ -145,6 +146,14 @@ export default function App() {
                   element={
                     <PrivateRoute>
                       <Profile />
+                    </PrivateRoute>
+                  }
+                />
+                <Route
+                  path="/profile/identity"
+                  element={
+                    <PrivateRoute>
+                      <ContributorIdentityPage />
                     </PrivateRoute>
                   }
                 />
