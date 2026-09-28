@@ -9,7 +9,7 @@
     "lint": "eslint src/ db/ scripts/",
     "lint:fix": "eslint src/ db/ scripts/ --fix",
     "format:check": "prettier --check src/ db/ scripts/",
-    "test": "node --test --test-force-exit --test-timeout=30000 src/**/*.test.js src/*.test.js",
+    "test": "node scripts/run-tests.js",
     "migrate": "node db/migrate.js up",
     "migrate:status": "node db/migrate.js status",
     "migrate:down": "node db/migrate.js down",
