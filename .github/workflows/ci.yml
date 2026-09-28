@@ -145,6 +145,65 @@ jobs:
           VITE_SENTRY_RELEASE: ${{ github.sha }}
         run: npm run build
 
+  # -----------------------------------------------------------------------
+  # smoke-tests: Deterministic Playwright checks against mocked public
+  # routes. No PostgreSQL, Stellar testnet, or external API calls are made;
+  # all backend traffic is intercepted inside the browser by the spec's
+  # page.route() handler.
+  #
+  # This job is intended to be a REQUIRED status check in repository
+  # branch-protection settings (Settings → Branches → Require status
+  # checks → "smoke-tests"). Add it there once the first run passes.
+  # -----------------------------------------------------------------------
+  smoke-tests:
+    runs-on: ubuntu-latest
+    # Run after frontend dependencies are known to install and build cleanly,
+    # so we don't waste Chromium download time on a broken frontend.
+    needs: frontend-checks
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          # Root lock-file owns @playwright/test; frontend lock-file owns vite.
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install root dependencies (@playwright/test)
+        run: npm ci
+
+      - name: Install frontend dependencies (vite dev server)
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Install Playwright Chromium browser + OS dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Run public smoke tests
+        run: npm run test:public
+
+      - name: Upload Playwright traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: test-results/
+          retention-days: 7
+
+      - name: Upload Playwright screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-screenshots
+          path: test-results/**/*.png
+          retention-days: 7
+
   soroban-contracts:
     runs-on: ubuntu-latest
 
