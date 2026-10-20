@@ -28,9 +28,11 @@ const campaignRouter = express.Router();
 const userRouter = express.Router();
 
 const MAX_MATCH_RATIO = 100;
-// campaign_matches.pledge_amount is NUMERIC(20, 7); cap the request well below
-// the column limit so an out-of-range value fails validation, not the insert.
-const MAX_PLEDGE_AMOUNT = 1e13;
+// Maximum pledge in Stellar asset units. Stellar's int64 stroop limit is
+// 922337203685.4775807 — cap well below that so validation errors are
+// user-facing rather than a DB overflow or stroop overflow.
+// Stored and compared as a decimal string, never a JS float.
+const MAX_PLEDGE_AMOUNT_STR = '500000000000'; // 5 × 10^11, ~54% of Stellar max
 
 function respondValidationErrors(req, res) {
   const errors = validationResult(req);
@@ -86,11 +88,18 @@ function runAudit(payload) {
  *                 example: 1
  *               pledge_amount:
  *                 type: string
- *                 description: Total matching pool in the campaign asset
- *                 example: "1000"
+ *                 description: >
+ *                   Total matching pool in the campaign asset, expressed as a
+ *                   decimal string with at most 7 fractional digits (Stellar
+ *                   precision).  The value is stored and returned in this same
+ *                   canonical form ("1000.0000000") so callers never need to
+ *                   parse a floating-point number.
+ *                 example: "1000.0000000"
  *     responses:
  *       201:
- *         description: Matching pledge created
+ *         description: >
+ *           Matching pledge created.  All monetary fields in the response
+ *           (pledge_amount, matched_amount) are canonical 7-decimal strings.
  *       400:
  *         description: Invalid input
  *       401:
@@ -105,12 +114,28 @@ campaignRouter.post(
   requireAuth,
   param('id').isUUID(),
   body('match_ratio').isFloat({ gt: 0, max: MAX_MATCH_RATIO }).toFloat(),
-  body('pledge_amount').isFloat({ gt: 0, lt: MAX_PLEDGE_AMOUNT }).toFloat(),
+  // pledge_amount is kept as a string — toStroops validates and normalises it
+  // inside createMatchingPledge.  We only do a cheap structural check here so
+  // that obviously bad input (empty, non-numeric, negative) returns 400 before
+  // we hit the service.
+  body('pledge_amount')
+    .isString()
+    .notEmpty()
+    .matches(/^[0-9]+(\.[0-9]+)?$/)
+    .withMessage('pledge_amount must be a positive decimal string')
+    .custom(value => {
+      const { toStroops: _ts } = require('../utils/stroops');
+      _ts(value); // throws AmountError if zero, negative, too-precise, or too-large
+      return true;
+    }),
   asyncHandler(async (req, res) => {
     if (respondValidationErrors(req, res)) return;
 
     const campaignId = req.params.id;
     const { match_ratio: matchRatio, pledge_amount: pledgeAmount } = req.body;
+    // pledgeAmount is a validated decimal string; matchRatio is a JS float
+    // (match_ratio has at most 2 DB decimal places and is not monetary — it is
+    // safe to keep as a number for the INSERT column).
 
     // Verify campaign exists and is still open to sponsorship
     const { rows: campaigns } = await db.query(
@@ -190,7 +215,11 @@ campaignRouter.post(
  *           type: string
  *     responses:
  *       200:
- *         description: Matching progress data
+ *         description: >
+ *           Matching progress data.  All monetary fields (pledgeAmount,
+ *           matchedAmount, remainingAmount, totalPledged, totalMatched,
+ *           remainingPoolAmount) are canonical 7-decimal strings.
+ *           percentageUsed is a string formatted as "xx.xx".
  *       404:
  *         description: Campaign not found
  */
@@ -306,13 +335,14 @@ campaignRouter.patch(
       req,
     });
 
-    // Emit webhook
+    // Emit webhook — unclaimed amount computed in BigInt stroops so the
+    // subtraction is exact even for fractional amounts.
     emitWebhookEventForCampaign(campaignId, WEBHOOK_EVENTS.SPONSOR_MATCH_COMPLETED, {
       match_id: completed.id,
       sponsor_user_id: completed.sponsor_user_id,
       unclaimed_amount: fromStroops(
-        toStroops(completed.pledge_amount, { allowZero: true }) -
-          toStroops(completed.matched_amount, { allowZero: true })
+        toStroops(String(completed.pledge_amount), { allowZero: true }) -
+          toStroops(String(completed.matched_amount), { allowZero: true })
       ),
     }).catch(err => logger.error('Webhook emit failed', { err }));
 

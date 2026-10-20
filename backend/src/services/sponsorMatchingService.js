@@ -1,15 +1,24 @@
+/**
+ * Sponsor matching service.
+ *
+ * All monetary amounts are handled as BigInt stroops internally (1 unit =
+ * 10^7 stroops, matching Stellar's 7-decimal precision).  The single
+ * conversion boundary is the public API surface:
+ *
+ *   • Inbound  – a validated decimal string is converted to BigInt stroops
+ *                by `toStroops` once and never touched as a JS number again.
+ *   • Outbound – BigInt stroops are serialised to a canonical 7-decimal
+ *                string by `fromStroops` immediately before the value leaves
+ *                this module.
+ *
+ * This eliminates the `parseFloat / toFixed` drift that caused pool
+ * over-spending and required the data-repair UPDATE in migration
+ * 20260930_sponsor_matching_hardening.sql (#1064).
+ */
+
 const db = require('../config/database');
 const logger = require('../config/logger');
-
-const AMOUNT_PRECISION = 7;
-
-function roundAmount(value) {
-  return parseFloat(Number(value).toFixed(AMOUNT_PRECISION));
-}
-
-function roundPercent(value) {
-  return parseFloat(Number(value).toFixed(2));
-}
+const { toStroops, fromStroops, AmountError } = require('../utils/stroops');
 
 /**
  * Thrown when a sponsor already holds an active matching pledge for a campaign.
@@ -34,16 +43,68 @@ function isDuplicatePledgeViolation(err) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a DB NUMERIC string (or number) to BigInt stroops.
+ * Throws AmountError on malformed input; passes `allowZero` through so that
+ * `matched_amount = 0` rows are accepted.
+ */
+function dbAmountToStroops(value, { allowZero = false } = {}) {
+  return toStroops(String(value), { allowZero });
+}
+
+/**
+ * Apply match_ratio (stored as NUMERIC(10,2)) to a contribution amount in
+ * stroops.  The ratio is multiplied as fixed-point integer arithmetic:
+ *
+ *   match_ratio is a decimal like "1.00" or "2.50".
+ *   We parse it as (integer * 100 + fraction) / 100 to stay in BigInt land.
+ *
+ *   result = floor(contributionStroops * ratioNumerator / 100)
+ *
+ * Floor is the correct rounding direction: we must never credit more than the
+ * sponsor offered.
+ */
+function applyRatio(contributionStroops, matchRatioString) {
+  // matchRatioString is e.g. "1.00", "2.50", "0.50".
+  const ratioStr = String(matchRatioString).trim();
+  const dotIdx = ratioStr.indexOf('.');
+  let ratioNumerator;
+  if (dotIdx === -1) {
+    // Integer ratio — no decimal part.
+    ratioNumerator = BigInt(ratioStr) * 100n;
+  } else {
+    const intPart = ratioStr.slice(0, dotIdx) || '0';
+    // Pad / truncate fractional part to exactly 2 digits (matches NUMERIC(10,2)).
+    const fracRaw = ratioStr.slice(dotIdx + 1);
+    const fracPart = fracRaw.slice(0, 2).padEnd(2, '0');
+    ratioNumerator = BigInt(intPart) * 100n + BigInt(fracPart);
+  }
+  // floor division: never over-credit.
+  return (contributionStroops * ratioNumerator) / 100n;
+}
+
+// ---------------------------------------------------------------------------
+// Public functions
+// ---------------------------------------------------------------------------
+
 /**
  * Create a sponsor matching pledge for a campaign.
  *
- * @param {Object} params - Parameters
- * @param {string} params.campaignId - Campaign UUID
- * @param {string} params.sponsorUserId - Sponsor user UUID
- * @param {number} params.matchRatio - Match ratio (e.g., 1.0 for 1:1, 2.0 for 2:1)
- * @param {string|number} params.pledgeAmount - Total pool amount in campaign asset
- * @param {Object} [params.client] - Optional transaction client
- * @returns {Promise<Object>} Created campaign_matches row
+ * `pledgeAmount` must be a decimal string that is exactly representable in
+ * Stellar stroops (at most 7 fractional digits).  It is validated here and
+ * stored in the DB as a NUMERIC(20,7) canonical 7-decimal string.
+ *
+ * @param {Object} params
+ * @param {string}        params.campaignId     - Campaign UUID
+ * @param {string}        params.sponsorUserId  - Sponsor user UUID
+ * @param {number|string} params.matchRatio     - Match multiplier (e.g. 1, 2.5)
+ * @param {string}        params.pledgeAmount   - Total pool in campaign asset (decimal string)
+ * @param {Object}        [params.client]       - Optional transaction client
+ * @returns {Promise<Object>} Created campaign_matches row (amounts as decimal strings)
  */
 async function createMatchingPledge({
   campaignId,
@@ -52,23 +113,33 @@ async function createMatchingPledge({
   pledgeAmount,
   client,
 }) {
-  // Validate inputs
   if (!campaignId || !sponsorUserId) {
     throw new Error('campaignId and sponsorUserId are required');
   }
-  if (!matchRatio || matchRatio <= 0) {
+  if (!matchRatio || Number(matchRatio) <= 0) {
     throw new Error('matchRatio must be positive');
   }
-  if (!pledgeAmount || pledgeAmount <= 0) {
-    throw new Error('pledgeAmount must be positive');
+
+  // Validate and normalise pledgeAmount to canonical 7-decimal string at the
+  // boundary.  AmountError (bad format, zero, negative, too-precise, too-large)
+  // propagates as a 400 to the caller.
+  let pledgeStroops;
+  try {
+    pledgeStroops = toStroops(String(pledgeAmount));
+  } catch (err) {
+    if (err instanceof AmountError) {
+      throw new Error(`pledgeAmount is invalid: ${err.message}`);
+    }
+    throw err;
   }
+  const normalisedPledge = fromStroops(pledgeStroops); // "1000.0000000"
 
   const runner = client || db;
 
   // Fast path: reject an obvious duplicate before touching the unique index so
   // callers without a transaction still get a clean error.
   const { rows: existing } = await runner.query(
-    `SELECT id FROM campaign_matches 
+    `SELECT id FROM campaign_matches
      WHERE campaign_id = $1 AND sponsor_user_id = $2 AND status = 'active'`,
     [campaignId, sponsorUserId]
   );
@@ -80,15 +151,14 @@ async function createMatchingPledge({
   let rows;
   try {
     ({ rows } = await runner.query(
-      `INSERT INTO campaign_matches 
+      `INSERT INTO campaign_matches
          (campaign_id, sponsor_user_id, match_ratio, pledge_amount, matched_amount, status)
        VALUES ($1, $2, $3, $4, 0, 'active')
-       RETURNING id, campaign_id, sponsor_user_id, match_ratio, pledge_amount, 
+       RETURNING id, campaign_id, sponsor_user_id, match_ratio, pledge_amount,
                  matched_amount, status, created_at`,
-      [campaignId, sponsorUserId, matchRatio, pledgeAmount]
+      [campaignId, sponsorUserId, matchRatio, normalisedPledge]
     ));
   } catch (err) {
-    // Lost the race against a concurrent pledge from the same sponsor.
     if (isDuplicatePledgeViolation(err)) {
       throw new DuplicateMatchingPledgeError();
     }
@@ -99,7 +169,7 @@ async function createMatchingPledge({
     campaignId,
     sponsorUserId,
     matchId: rows[0].id,
-    pledgeAmount,
+    pledgeAmount: normalisedPledge,
     matchRatio,
   });
 
@@ -108,19 +178,20 @@ async function createMatchingPledge({
 
 /**
  * Process a contribution and apply matching funds if applicable.
- * Returns the amount matched (0 if no matching available).
+ * Returns the matched amount as a canonical 7-decimal string ("0.0000000" when
+ * no matching occurs), never a JS number.
  *
  * The active pool row is locked with `FOR UPDATE` so two contributions landing
  * at the same time cannot both spend the same pool capacity, and the
  * contribution is claimed exactly once (guarded by `match_amount = 0`) so a
  * replayed/duplicated indexing pass cannot double-match or double-credit it.
  *
- * @param {Object} params - Parameters
- * @param {string} params.campaignId - Campaign UUID
- * @param {string} params.contributionId - Contribution UUID
- * @param {number|string} params.contributionAmount - Amount contributed
- * @param {Object} [params.client] - Optional transaction client
- * @returns {Promise<number>} Amount matched
+ * @param {Object} params
+ * @param {string}        params.campaignId          - Campaign UUID
+ * @param {string}        params.contributionId      - Contribution UUID
+ * @param {string|number} params.contributionAmount  - Amount contributed (decimal string)
+ * @param {Object}        [params.client]            - Optional transaction client
+ * @returns {Promise<string>} Canonical 7-decimal matched amount string
  */
 async function processContributionMatch({
   campaignId,
@@ -128,25 +199,31 @@ async function processContributionMatch({
   contributionAmount,
   client,
 }) {
-  const runner = client || db;
-
-  if (!campaignId || !contributionId || !contributionAmount) {
+  if (!campaignId || !contributionId || contributionAmount == null) {
     throw new Error('campaignId, contributionId, and contributionAmount are required');
   }
 
-  const amount = parseFloat(contributionAmount);
-  if (isNaN(amount) || amount <= 0) {
-    throw new Error('contributionAmount must be a positive number');
+  // Single conversion at the validated boundary.
+  let contributionStroops;
+  try {
+    contributionStroops = toStroops(String(contributionAmount));
+  } catch (err) {
+    if (err instanceof AmountError) {
+      throw new Error('contributionAmount must be a positive number');
+    }
+    throw err;
   }
 
-  // Lock the oldest pool that still has capacity. Pools that are already
+  const runner = client || db;
+
+  // Lock the oldest pool that still has capacity.  Pools that are already
   // exhausted are skipped here as well as at write time so stale `active`
   // status rows cannot silently absorb a contribution.
   const { rows: matches } = await runner.query(
-    `SELECT id, match_ratio, pledge_amount, matched_amount 
-     FROM campaign_matches 
-     WHERE campaign_id = $1 
-       AND status = 'active' 
+    `SELECT id, match_ratio, pledge_amount, matched_amount
+     FROM campaign_matches
+     WHERE campaign_id = $1
+       AND status = 'active'
        AND matched_amount < pledge_amount
      ORDER BY created_at ASC, id ASC
      LIMIT 1
@@ -155,32 +232,39 @@ async function processContributionMatch({
   );
 
   if (!matches.length) {
-    // No matching available
-    return 0;
+    return fromStroops(0n); // "0.0000000"
   }
 
   const match = matches[0];
 
-  // Calculate matched amount based on ratio, capped at the remaining pool.
-  const calculatedMatch = roundAmount(amount * parseFloat(match.match_ratio));
-  const remainingPool = roundAmount(
-    parseFloat(match.pledge_amount) - parseFloat(match.matched_amount)
-  );
-  const actualMatch = roundAmount(Math.min(calculatedMatch, remainingPool));
+  // All arithmetic in BigInt stroops — no floating point.
+  const pledgeStroops = dbAmountToStroops(match.pledge_amount);
+  const matchedSoFarStroops = dbAmountToStroops(match.matched_amount, { allowZero: true });
 
-  if (actualMatch <= 0) {
-    return 0;
+  const remainingPool = pledgeStroops - matchedSoFarStroops;
+  if (remainingPool <= 0n) {
+    return fromStroops(0n);
   }
 
-  // Claim this contribution for matching exactly once. A second call for the
+  const calculatedMatch = applyRatio(contributionStroops, match.match_ratio);
+  // Cap at remaining pool; never over-credit.
+  const actualMatchStroops = calculatedMatch < remainingPool ? calculatedMatch : remainingPool;
+
+  if (actualMatchStroops <= 0n) {
+    return fromStroops(0n);
+  }
+
+  const actualMatchString = fromStroops(actualMatchStroops); // canonical 7-decimal
+
+  // Claim this contribution for matching exactly once.  A second call for the
   // same contribution (retry, replayed transaction, concurrent indexer) is a
   // no-op rather than a second spend.
   const { rows: claimed } = await runner.query(
-    `UPDATE contributions 
+    `UPDATE contributions
      SET match_amount = $1, campaign_match_id = $2
      WHERE id = $3 AND COALESCE(match_amount, 0) = 0
      RETURNING id`,
-    [actualMatch, match.id, contributionId]
+    [actualMatchString, match.id, contributionId]
   );
 
   if (!claimed.length) {
@@ -189,21 +273,22 @@ async function processContributionMatch({
       contributionId,
       matchId: match.id,
     });
-    return 0;
+    return fromStroops(0n);
   }
 
-  // Determine if pool becomes exhausted
-  const newMatchedAmount = roundAmount(parseFloat(match.matched_amount) + actualMatch);
-  const isExhausted = newMatchedAmount >= parseFloat(match.pledge_amount);
+  // Determine exhaustion via exact BigInt comparison.
+  const newMatchedStroops = matchedSoFarStroops + actualMatchStroops;
+  const isExhausted = newMatchedStroops >= pledgeStroops;
+  const newMatchedString = fromStroops(newMatchedStroops);
 
-  // Update matching pool
+  // Update matching pool.
   await runner.query(
-    `UPDATE campaign_matches 
-     SET matched_amount = $1, 
+    `UPDATE campaign_matches
+     SET matched_amount = $1,
          status = $2,
          updated_at = NOW()
      WHERE id = $3`,
-    [newMatchedAmount, isExhausted ? 'exhausted' : 'active', match.id]
+    [newMatchedString, isExhausted ? 'exhausted' : 'active', match.id]
   );
 
   // Sponsor funds are part of the campaign ledger: credit them in the same
@@ -217,38 +302,39 @@ async function processContributionMatch({
            ELSE status
          END
      WHERE id = $2 AND deleted_at IS NULL`,
-    [actualMatch, campaignId]
+    [actualMatchString, campaignId]
   );
 
   logger.info('Processed contribution matching', {
     campaignId,
     contributionId,
     matchId: match.id,
-    contributionAmount: amount,
+    contributionAmount: fromStroops(contributionStroops),
     matchRatio: match.match_ratio,
-    matchedAmount: actualMatch,
+    matchedAmount: actualMatchString,
     poolExhausted: isExhausted,
   });
 
-  return actualMatch;
+  return actualMatchString;
 }
 
 /**
  * Get all matching pledges and aggregated progress for a campaign.
  *
- * The response is served by a public endpoint, so it deliberately omits sponsor
- * user IDs and any other internal identifiers.
+ * The response is served by a public endpoint so it deliberately omits sponsor
+ * user IDs and any other internal identifiers.  All amounts are canonical
+ * 7-decimal strings — never JS floats.
  *
- * @param {string} campaignId - Campaign UUID
- * @param {Object} [params] - Options
- * @param {Object} [params.client] - Optional transaction client
- * @returns {Promise<Object>} Aggregated matching data
+ * @param {string} campaignId
+ * @param {Object} [params]
+ * @param {Object} [params.client]
+ * @returns {Promise<Object>}
  */
 async function getCampaignMatchProgress(campaignId, { client } = {}) {
   const runner = client || db;
 
   const { rows } = await runner.query(
-    `SELECT 
+    `SELECT
        cm.id,
        cm.sponsor_user_id,
        u.name as sponsor_name,
@@ -268,32 +354,68 @@ async function getCampaignMatchProgress(campaignId, { client } = {}) {
     [campaignId]
   );
 
-  // Calculate aggregates
-  const totalPledged = rows.reduce((sum, row) => sum + parseFloat(row.pledge_amount), 0);
-  const totalMatched = rows.reduce((sum, row) => sum + parseFloat(row.matched_amount), 0);
-  const activeMatches = rows.filter(r => r.status === 'active');
-  const exhaustedMatches = rows.filter(r => r.status === 'exhausted');
+  // Aggregate in BigInt stroops — no parseFloat anywhere.
+  let totalPledgedStroops = 0n;
+  let totalMatchedStroops = 0n;
+  const activeMatches = [];
+  const exhaustedMatches = [];
+
+  const mappedRows = rows.map(r => {
+    const pledgeStroops = dbAmountToStroops(r.pledge_amount);
+    const matchedStroops = dbAmountToStroops(r.matched_amount, { allowZero: true });
+    const remainingStroops = pledgeStroops - matchedStroops;
+
+    totalPledgedStroops += pledgeStroops;
+    totalMatchedStroops += matchedStroops;
+
+    if (r.status === 'active') activeMatches.push(r);
+    if (r.status === 'exhausted') exhaustedMatches.push(r);
+
+    // total_contributed is an aggregate of contribution.amount (not matching
+    // amounts) — it comes from a SUM() so it may be a large decimal.  Use
+    // allowZero because a pool with no contributions returns 0.
+    const totalContribStroops = toStroops(String(r.total_contributed), { allowZero: true });
+
+    return {
+      id: r.id,
+      sponsorName: r.sponsor_name,
+      matchRatio: r.match_ratio,           // kept as DB string, exact
+      pledgeAmount: fromStroops(pledgeStroops),
+      matchedAmount: fromStroops(matchedStroops),
+      remainingAmount: remainingStroops > 0n ? fromStroops(remainingStroops) : fromStroops(0n),
+      status: r.status,
+      contributionCount: parseInt(r.contribution_count, 10),
+      totalContributed: fromStroops(totalContribStroops),
+      createdAt: r.created_at,
+    };
+  });
+
+  const remainingTotalStroops =
+    totalPledgedStroops > totalMatchedStroops
+      ? totalPledgedStroops - totalMatchedStroops
+      : 0n;
+
+  // percentageUsed: (totalMatched / totalPledged) * 100, rounded to 2 dp.
+  // Computed in integer arithmetic to avoid float drift.
+  let percentageUsed = '0.00';
+  if (totalPledgedStroops > 0n) {
+    // Multiply by 10000 before dividing to get 2 decimal places via integer
+    // division, then format as "xx.xx".
+    const scaled = (totalMatchedStroops * 10000n) / totalPledgedStroops; // 0–10000
+    const whole = scaled / 100n;
+    const frac = scaled % 100n;
+    percentageUsed = `${whole}.${String(frac).padStart(2, '0')}`;
+  }
 
   return {
     campaignId,
-    matches: rows.map(r => ({
-      id: r.id,
-      sponsorName: r.sponsor_name,
-      matchRatio: parseFloat(r.match_ratio),
-      pledgeAmount: parseFloat(r.pledge_amount),
-      matchedAmount: parseFloat(r.matched_amount),
-      remainingAmount: Math.max(0, parseFloat(r.pledge_amount) - parseFloat(r.matched_amount)),
-      status: r.status,
-      contributionCount: parseInt(r.contribution_count, 10),
-      totalContributed: parseFloat(r.total_contributed),
-      createdAt: r.created_at,
-    })),
-    totalPledged: roundAmount(totalPledged),
-    totalMatched: roundAmount(totalMatched),
-    remainingPoolAmount: Math.max(0, roundAmount(totalPledged - totalMatched)),
+    matches: mappedRows,
+    totalPledged: fromStroops(totalPledgedStroops),
+    totalMatched: fromStroops(totalMatchedStroops),
+    remainingPoolAmount: fromStroops(remainingTotalStroops),
     activePoolCount: activeMatches.length,
     exhaustedPoolCount: exhaustedMatches.length,
-    percentageUsed: totalPledged > 0 ? roundPercent((totalMatched / totalPledged) * 100) : 0,
+    percentageUsed,
   };
 }
 
@@ -301,16 +423,16 @@ async function getCampaignMatchProgress(campaignId, { client } = {}) {
  * Mark a matching pool as completed (campaign ended).
  * Sponsor can reclaim unmatched funds.
  *
- * @param {string} matchId - Match UUID
- * @param {Object} [params] - Options
- * @param {Object} [params.client] - Optional transaction client
- * @returns {Promise<Object>} Updated match record
+ * @param {string} matchId
+ * @param {Object} [params]
+ * @param {Object} [params.client]
+ * @returns {Promise<Object>} Updated match record (amounts as DB strings)
  */
 async function completeMatchingPledge(matchId, { client } = {}) {
   const runner = client || db;
 
   const { rows } = await runner.query(
-    `UPDATE campaign_matches 
+    `UPDATE campaign_matches
      SET status = 'completed', updated_at = NOW()
      WHERE id = $1 AND status IN ('active', 'exhausted')
      RETURNING *`,
@@ -322,7 +444,11 @@ async function completeMatchingPledge(matchId, { client } = {}) {
   }
 
   const match = rows[0];
-  const unclaimedAmount = parseFloat(match.pledge_amount) - parseFloat(match.matched_amount);
+
+  // Compute unclaimed amount in BigInt stroops for safe logging.
+  const pledgeStroops = dbAmountToStroops(match.pledge_amount);
+  const matchedStroops = dbAmountToStroops(match.matched_amount, { allowZero: true });
+  const unclaimedAmount = fromStroops(pledgeStroops - matchedStroops);
 
   logger.info('Completed matching pledge', {
     matchId,
@@ -337,16 +463,16 @@ async function completeMatchingPledge(matchId, { client } = {}) {
 /**
  * Get matching pledges for a specific sponsor (across all campaigns).
  *
- * @param {string} sponsorUserId - User UUID
- * @param {Object} [params] - Options
- * @param {Object} [params.client] - Optional transaction client
- * @returns {Promise<Array>} Array of matching records
+ * @param {string} sponsorUserId
+ * @param {Object} [params]
+ * @param {Object} [params.client]
+ * @returns {Promise<Array>}
  */
 async function getSponsorMatchingPledges(sponsorUserId, { client } = {}) {
   const runner = client || db;
 
   const { rows } = await runner.query(
-    `SELECT 
+    `SELECT
        cm.*,
        c.title as campaign_title,
        c.status as campaign_status,
@@ -359,21 +485,27 @@ async function getSponsorMatchingPledges(sponsorUserId, { client } = {}) {
     [sponsorUserId]
   );
 
-  return rows.map(r => ({
-    id: r.id,
-    campaignId: r.campaign_id,
-    campaignTitle: r.campaign_title,
-    campaignStatus: r.campaign_status,
-    sponsorUserId: r.sponsor_user_id,
-    sponsorName: r.sponsor_name,
-    matchRatio: parseFloat(r.match_ratio),
-    pledgeAmount: parseFloat(r.pledge_amount),
-    matchedAmount: parseFloat(r.matched_amount),
-    remainingAmount: Math.max(0, parseFloat(r.pledge_amount) - parseFloat(r.matched_amount)),
-    status: r.status,
-    contractId: r.contract_id,
-    createdAt: r.created_at,
-  }));
+  return rows.map(r => {
+    const pledgeStroops = dbAmountToStroops(r.pledge_amount);
+    const matchedStroops = dbAmountToStroops(r.matched_amount, { allowZero: true });
+    const remainingStroops = pledgeStroops - matchedStroops;
+
+    return {
+      id: r.id,
+      campaignId: r.campaign_id,
+      campaignTitle: r.campaign_title,
+      campaignStatus: r.campaign_status,
+      sponsorUserId: r.sponsor_user_id,
+      sponsorName: r.sponsor_name,
+      matchRatio: r.match_ratio,           // kept as DB string, exact
+      pledgeAmount: fromStroops(pledgeStroops),
+      matchedAmount: fromStroops(matchedStroops),
+      remainingAmount: remainingStroops > 0n ? fromStroops(remainingStroops) : fromStroops(0n),
+      status: r.status,
+      contractId: r.contract_id,
+      createdAt: r.created_at,
+    };
+  });
 }
 
 module.exports = {

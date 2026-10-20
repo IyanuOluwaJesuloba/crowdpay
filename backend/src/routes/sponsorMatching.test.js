@@ -25,12 +25,12 @@ function buildRouters({ queryImpl, serviceImpl }) {
     getCampaignMatchProgress: async () => ({
       campaignId: CAMPAIGN_UUID,
       matches: [],
-      totalPledged: 0,
-      totalMatched: 0,
-      remainingPoolAmount: 0,
+      totalPledged: '0.0000000',
+      totalMatched: '0.0000000',
+      remainingPoolAmount: '0.0000000',
       activePoolCount: 0,
       exhaustedPoolCount: 0,
-      percentageUsed: 0,
+      percentageUsed: '0.00',
     }),
     completeMatchingPledge: async () => ({}),
     getSponsorMatchingPledges: async () => [],
@@ -90,9 +90,9 @@ test('POST /campaigns/:id/matches creates a matching pledge', async () => {
     id: MATCH_UUID,
     campaign_id: CAMPAIGN_UUID,
     sponsor_user_id: 'user-uuid-1',
-    match_ratio: 1.0,
-    pledge_amount: '1000',
-    matched_amount: '0',
+    match_ratio: '1.00',
+    pledge_amount: '1000.0000000',
+    matched_amount: '0.0000000',
     status: 'active',
     created_at: '2026-08-01T00:00:00.000Z',
   };
@@ -180,6 +180,48 @@ test('POST /campaigns/:id/matches validates positive pledge amount', async () =>
   assert.equal(res.status, 400);
 });
 
+test('POST /campaigns/:id/matches rejects a pledge_amount with 8 decimal places', async () => {
+  const { campaignRouter } = buildRouters({ queryImpl: async () => ({ rows: [] }) });
+
+  const res = await request(buildApp(campaignRouter))
+    .post(`/${CAMPAIGN_UUID}/matches`)
+    .send({ match_ratio: 1.0, pledge_amount: '1.00000001' });
+
+  assert.equal(res.status, 400);
+});
+
+test('POST /campaigns/:id/matches accepts a fractional pledge_amount', async () => {
+  const mockPledge = {
+    id: MATCH_UUID,
+    campaign_id: CAMPAIGN_UUID,
+    sponsor_user_id: 'user-uuid-1',
+    match_ratio: '1.00',
+    pledge_amount: '0.3000000',
+    matched_amount: '0.0000000',
+    status: 'active',
+    created_at: '2026-08-01T00:00:00.000Z',
+  };
+
+  const { campaignRouter } = buildRouters({
+    queryImpl: async text => {
+      if (text.includes('FROM campaigns')) {
+        return { rows: [{ id: CAMPAIGN_UUID, status: 'active' }] };
+      }
+      return { rows: [] };
+    },
+    serviceImpl: {
+      createMatchingPledge: async () => mockPledge,
+    },
+  });
+
+  const res = await request(buildApp(campaignRouter))
+    .post(`/${CAMPAIGN_UUID}/matches`)
+    .send({ match_ratio: 1.0, pledge_amount: '0.3' });
+
+  assert.equal(res.status, 201);
+  assert.equal(res.body.pledge_amount, '0.3000000');
+});
+
 test('POST /campaigns/:id/matches rejects an invalid campaign id', async () => {
   const { campaignRouter } = buildRouters({ queryImpl: async () => ({ rows: [] }) });
 
@@ -225,12 +267,12 @@ test('GET /campaigns/:id/matches returns campaign matching progress', async () =
       getCampaignMatchProgress: async () => ({
         campaignId: CAMPAIGN_UUID,
         matches: [],
-        totalPledged: 1000,
-        totalMatched: 300,
-        remainingPoolAmount: 700,
+        totalPledged: '1000.0000000',
+        totalMatched: '300.0000000',
+        remainingPoolAmount: '700.0000000',
         activePoolCount: 1,
         exhaustedPoolCount: 0,
-        percentageUsed: 30,
+        percentageUsed: '30.00',
       }),
     },
   });
@@ -238,8 +280,8 @@ test('GET /campaigns/:id/matches returns campaign matching progress', async () =
   const res = await request(buildApp(campaignRouter)).get(`/${CAMPAIGN_UUID}/matches`);
 
   assert.equal(res.status, 200);
-  assert.equal(res.body.totalPledged, 1000);
-  assert.equal(res.body.totalMatched, 300);
+  assert.equal(res.body.totalPledged, '1000.0000000');
+  assert.equal(res.body.totalMatched, '300.0000000');
   assert.ok(res.body.matches);
 });
 
@@ -264,8 +306,8 @@ test('PATCH completing a matching pledge emits an exact fixed-precision remainde
       completeMatchingPledge: async () => ({
         id: MATCH_UUID,
         sponsor_user_id: 'sponsor-1',
-        pledge_amount: '0.3',
-        matched_amount: '0.1',
+        pledge_amount: '0.3000000',
+        matched_amount: '0.1000000',
       }),
     },
   });
@@ -275,6 +317,7 @@ test('PATCH completing a matching pledge emits an exact fixed-precision remainde
   );
 
   assert.equal(res.status, 200);
+  // 0.3 - 0.1 = 0.2 — must be exact, not 0.19999999999999998.
   assert.equal(webhookEvents[0][2].unclaimed_amount, '0.2000000');
 });
 
@@ -289,10 +332,10 @@ test('GET /user/sponsor-matches returns sponsor pledges', async () => {
           campaignStatus: 'active',
           sponsorUserId: 'user-uuid-1',
           sponsorName: 'Sponsor',
-          matchRatio: 1.0,
-          pledgeAmount: 1000,
-          matchedAmount: 300,
-          remainingAmount: 700,
+          matchRatio: '1.00',
+          pledgeAmount: '1000.0000000',
+          matchedAmount: '300.0000000',
+          remainingAmount: '700.0000000',
           status: 'active',
           contractId: null,
           createdAt: new Date(),
@@ -305,7 +348,7 @@ test('GET /user/sponsor-matches returns sponsor pledges', async () => {
 
   assert.equal(res.status, 200);
   assert.equal(res.body.pledges.length, 1);
-  assert.equal(res.body.pledges[0].pledgeAmount, 1000);
+  assert.equal(res.body.pledges[0].pledgeAmount, '1000.0000000');
 });
 
 test('PATCH /campaigns/:id/matches/:matchId/complete completes a matching pledge', async () => {
@@ -319,8 +362,8 @@ test('PATCH /campaigns/:id/matches/:matchId/complete completes a matching pledge
               campaign_id: CAMPAIGN_UUID,
               sponsor_user_id: 'user-uuid-1',
               creator_id: 'creator-uuid',
-              pledge_amount: 1000,
-              matched_amount: 600,
+              pledge_amount: '1000.0000000',
+              matched_amount: '600.0000000',
               status: 'completed',
             },
           ],
@@ -333,8 +376,8 @@ test('PATCH /campaigns/:id/matches/:matchId/complete completes a matching pledge
         id: MATCH_UUID,
         campaign_id: CAMPAIGN_UUID,
         sponsor_user_id: 'user-uuid-1',
-        pledge_amount: 1000,
-        matched_amount: 600,
+        pledge_amount: '1000.0000000',
+        matched_amount: '600.0000000',
         status: 'completed',
       }),
     },
