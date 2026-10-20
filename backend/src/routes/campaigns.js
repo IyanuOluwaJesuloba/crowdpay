@@ -110,6 +110,7 @@ const { stripHtml } = require('../lib/sanitize');
 const { getSimhash, simhashSimilarity } = require('../utils/simhash');
 const { toStroops } = require('../utils/stroops');
 const { parsePagination } = require('../utils/pagination');
+const { checkOrigin } = require('../utils/originPolicy');
 const {
   assembleReport,
   generateSignedUrl,
@@ -1712,15 +1713,38 @@ function buildFundingBadgeSvg({ leftLabel, rightLabel }) {
   ].join('');
 }
 
-// Embeddable campaign widget data (public, with permissive CORS)
+// Embeddable campaign widget data (public, origin-gated via campaign allowlist #1063)
 router.get(
   '/:id/embed',
   asyncHandler(async (req, res) => {
-    res.header('Access-Control-Allow-Origin', '*');
+    const campaignId = req.params.id;
+
+    // Load campaign allowlist and enforce origin policy before returning data.
+    const { rows: originRows } = await db.query(
+      `SELECT origin FROM campaign_embed_allowed_origins
+       WHERE campaign_id = $1
+       ORDER BY created_at ASC`,
+      [campaignId]
+    );
+    const allowedOrigins = originRows.map(r => r.origin);
+    const originHeader = req.headers.origin || req.get('origin') || null;
+    const { allowed, reason } = checkOrigin(originHeader, allowedOrigins);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Origin not allowed for this embed',
+        code: 'ORIGIN_NOT_ALLOWED',
+        reason,
+      });
+    }
+
+    // Reflect only the allowed origin (or * for wildcard) — never a blanket *.
+    if (originHeader) {
+      res.header('Access-Control-Allow-Origin', originHeader);
+      res.header('Vary', 'Origin');
+    }
     res.header('Access-Control-Allow-Methods', 'GET');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
 
-    const campaignId = req.params.id;
     const summary = await loadPublicCampaignSummary(campaignId);
     if (!summary) return res.status(404).json({ error: 'Campaign not found' });
 
@@ -1746,11 +1770,34 @@ router.get(
 router.get(
   '/:id/widget',
   asyncHandler(async (req, res) => {
-    res.header('Access-Control-Allow-Origin', '*');
+    const campaignId = req.params.id;
+
+    // Load campaign allowlist and enforce origin policy before returning data.
+    const { rows: originRows } = await db.query(
+      `SELECT origin FROM campaign_embed_allowed_origins
+       WHERE campaign_id = $1
+       ORDER BY created_at ASC`,
+      [campaignId]
+    );
+    const allowedOrigins = originRows.map(r => r.origin);
+    const originHeader = req.headers.origin || req.get('origin') || null;
+    const { allowed, reason } = checkOrigin(originHeader, allowedOrigins);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Origin not allowed for this embed',
+        code: 'ORIGIN_NOT_ALLOWED',
+        reason,
+      });
+    }
+
+    // Reflect only the allowed origin — never a blanket *.
+    if (originHeader) {
+      res.header('Access-Control-Allow-Origin', originHeader);
+      res.header('Vary', 'Origin');
+    }
     res.header('Access-Control-Allow-Methods', 'GET');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
 
-    const campaignId = req.params.id;
     const summary = await loadPublicCampaignSummary(campaignId);
     if (!summary) return res.status(404).json({ error: 'Campaign not found' });
 

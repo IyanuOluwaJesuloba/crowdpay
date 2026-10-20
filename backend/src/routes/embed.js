@@ -12,8 +12,8 @@ const { getTrendingCampaigns } = require('../services/trendingService');
 const {
   signEmbedToken,
   verifyEmbedToken,
-  validateOrigin,
 } = require('../services/embedTokenJwtService');
+const { checkOrigin } = require('../utils/originPolicy');
 const { evaluateCampaign } = require('../services/fraudService');
 const { createNotification } = require('../services/notifications');
 
@@ -197,6 +197,13 @@ function extractEmbedToken(req) {
 
 /**
  * Middleware for validating embed token & origin.
+ *
+ * Origin enforcement (#1063):
+ *   1. Load the campaign's `campaign_embed_allowed_origins` list from the DB.
+ *   2. Pass the request Origin header through checkOrigin().
+ *   3. checkOrigin() handles absent headers (allow — server-to-server calls),
+ *      malformed origins (deny), wildcard entries, localhost dev opt-in, and
+ *      exact normalised-string matches.
  */
 async function authenticateEmbedToken(req, res, next) {
   const token = extractEmbedToken(req);
@@ -213,13 +220,14 @@ async function authenticateEmbedToken(req, res, next) {
     return res.status(401).json({ error: 'Embed token does not match campaign ID' });
   }
 
-  const originHeader = req.headers.origin || req.get('origin');
-  if (originHeader && !validateOrigin(originHeader, payload.origins)) {
-    return res.status(403).json({ error: 'Origin not allowed for this embed token' });
-  }
-
+  // Load the active DB token row first — this also serves as revocation check.
   const { rows } = await db.query(
-    `SELECT * FROM embed_tokens WHERE campaign_id = $1 AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT 1`,
+    `SELECT et.*
+     FROM embed_tokens et
+     WHERE et.campaign_id = $1
+       AND (et.expires_at IS NULL OR et.expires_at > NOW())
+     ORDER BY et.created_at DESC
+     LIMIT 1`,
     [payload.sub]
   );
 
@@ -228,6 +236,27 @@ async function authenticateEmbedToken(req, res, next) {
   }
 
   const activeToken = rows[0];
+
+  // Load the campaign-level origin allowlist.
+  const { rows: originRows } = await db.query(
+    `SELECT origin FROM campaign_embed_allowed_origins
+     WHERE campaign_id = $1
+     ORDER BY created_at ASC`,
+    [payload.sub]
+  );
+  const allowedOrigins = originRows.map(r => r.origin);
+
+  // Evaluate the request Origin against the campaign allowlist.
+  const originHeader = req.headers.origin || req.get('origin') || null;
+  const { allowed, reason } = checkOrigin(originHeader, allowedOrigins);
+  if (!allowed) {
+    return res.status(403).json({
+      error: 'Origin not allowed for this embed token',
+      code: 'ORIGIN_NOT_ALLOWED',
+      reason,
+    });
+  }
+
   db.query(
     `UPDATE embed_tokens SET last_used_at = NOW(), use_count = use_count + 1 WHERE id = $1`,
     [activeToken.id]

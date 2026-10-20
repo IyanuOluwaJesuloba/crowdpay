@@ -91,6 +91,7 @@ app.use('/api/creator', require('./routes/creatorAnalytics'));
 app.use('/api/creator', require('./routes/payoutForecast'));
 app.use('/api/disputes', require('./routes/disputes'));
 app.use('/api/emails', require('./routes/emails'));
+app.use('/api/campaigns', require('./routes/embedOrigins'));
 app.use('/api/embed', require('./routes/embed'));
 app.use('/api/governance', require('./routes/governance'));
 app.use('/health', require('./routes/health'));

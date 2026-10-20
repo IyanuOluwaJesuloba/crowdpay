@@ -28,6 +28,12 @@ function buildApp(queryImpl) {
       buildEmbedCsp: () => "default-src 'self'; frame-ancestors *; connect-src *",
       validateOrigin: () => true,
     },
+    // Stub originPolicy so the pre-existing tests (which don't test origin
+    // enforcement) are not broken by the new campaign allowlist check.
+    // The dedicated origin tests below use buildAppWithOriginPolicy instead.
+    '../utils/originPolicy': {
+      checkOrigin: () => ({ allowed: true, reason: 'stub' }),
+    },
   });
 
   const app = express();
@@ -360,4 +366,247 @@ test('POST contribute allows simulation when ALLOW_EMBED_SIMULATED_CONTRIBUTIONS
 
   if (prev === undefined) delete process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS;
   else process.env.ALLOW_EMBED_SIMULATED_CONTRIBUTIONS = prev;
+});
+
+// ─── Origin enforcement tests (#1063) ────────────────────────────────────────
+//
+// These tests use a separate buildApp variant that wires the REAL checkOrigin
+// utility instead of the stub validateOrigin: () => true used above.
+// The DB stub returns an `allowed_origins` list that drives the policy.
+
+function buildAppWithOriginPolicy(queryImpl, localhostOptIn = false) {
+  const savedEnv = { ...process.env };
+
+  const router = proxyquire('./embed', {
+    '../config/database': { query: queryImpl },
+    '../utils/asyncHandler': fn => (req, res, next) => fn(req, res, next).catch(next),
+    '../middleware/rateLimiter': {
+      embedStatsLimiter: (_req, _res, next) => next(),
+    },
+    '../services/embedTokenJwtService': {
+      signEmbedToken: () => {},
+      verifyEmbedToken: token => {
+        try {
+          return jwt.verify(token, JWT_SECRET);
+        } catch {
+          return null;
+        }
+      },
+      signMilestoneWidgetToken: () => {},
+    },
+    // Use the REAL originPolicy module.
+    '../utils/originPolicy': require('../utils/originPolicy'),
+  });
+
+  if (localhostOptIn) {
+    process.env.EMBED_ALLOW_LOCALHOST = 'true';
+    process.env.NODE_ENV = 'development';
+  }
+
+  const app = express();
+  app.use(express.json());
+  app.use('/api/embed', router);
+
+  // Restore env after each request (for isolation in the test process).
+  app.use((_req, _res, next) => {
+    Object.assign(process.env, savedEnv);
+    next();
+  });
+
+  return { app, restore: () => Object.assign(process.env, savedEnv) };
+}
+
+function originQueryImpl(allowedOrigins = []) {
+  return async (sql, _params) => {
+    // Return the origin allowlist rows.
+    if (
+      sql.includes('FROM campaign_embed_allowed_origins') &&
+      sql.includes('SELECT origin')
+    ) {
+      return { rows: allowedOrigins.map(o => ({ origin: o })) };
+    }
+    // Return a valid embed_token row.
+    if (sql.includes('FROM embed_tokens')) {
+      return {
+        rows: [
+          {
+            id: TOKEN_ID,
+            campaign_id: CAMPAIGN_ID,
+            expires_at: null,
+            use_count: 0,
+          },
+        ],
+      };
+    }
+    if (sql.includes('UPDATE embed_tokens')) return { rows: [] };
+    return { rows: [] };
+  };
+}
+
+// ── GET /campaigns/:id — allowlist enforcement ────────────────────────────────
+
+test('embed token endpoint: allows request when Origin is in the campaign allowlist', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(
+    originQueryImpl(['https://app.example.com'])
+  );
+
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'https://app.example.com');
+
+  // 404 from the DB (no campaign row) is fine — origin check passed.
+  assert.notEqual(res.status, 403);
+});
+
+test('embed token endpoint: rejects request with Origin not in the campaign allowlist', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(
+    originQueryImpl(['https://allowed.example.com'])
+  );
+
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'https://evil.example.com');
+
+  assert.equal(res.status, 403);
+  assert.equal(res.body.code, 'ORIGIN_NOT_ALLOWED');
+});
+
+test('embed token endpoint: denies when allowlist is empty and Origin is sent', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(originQueryImpl([])); // no allowlist
+
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'https://any.site.example.com');
+
+  assert.equal(res.status, 403);
+  assert.equal(res.body.reason, 'no-allowlist');
+});
+
+test('embed token endpoint: allows server-to-server requests without an Origin header', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(originQueryImpl([])); // no allowlist
+
+  // No Origin header → server-to-server call; should not be blocked.
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`);
+
+  // 404 from missing DB rows is fine — 403 would be wrong.
+  assert.notEqual(res.status, 403);
+});
+
+test('embed token endpoint: rejects a malformed Origin header', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(
+    originQueryImpl(['https://example.com'])
+  );
+
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'not-a-valid-origin');
+
+  assert.equal(res.status, 403);
+  assert.equal(res.body.reason, 'malformed-origin');
+});
+
+test('embed token endpoint: allows any origin when the allowlist contains "*"', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(originQueryImpl(['*']));
+
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'https://absolutely-any-site.example.com');
+
+  assert.notEqual(res.status, 403);
+});
+
+test('embed token endpoint: normalises Origin with default port before comparing', async () => {
+  // Allowlist has origin without port; request sends with :443.
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(
+    originQueryImpl(['https://example.com'])
+  );
+
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'https://example.com:443');
+
+  assert.notEqual(res.status, 403);
+});
+
+test('embed token endpoint: rejects a subdomain not in the allowlist', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(
+    originQueryImpl(['https://example.com'])
+  );
+
+  // Subdomain is NOT automatically covered by a parent-domain entry.
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'https://sub.example.com');
+
+  assert.equal(res.status, 403);
+});
+
+test('embed token endpoint: rejects a non-default port not in the allowlist', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app } = buildAppWithOriginPolicy(
+    originQueryImpl(['https://example.com'])
+  );
+
+  const res = await request(app)
+    .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+    .set('Authorization', `Bearer ${embedToken}`)
+    .set('Origin', 'https://example.com:8443');
+
+  assert.equal(res.status, 403);
+});
+
+// ── Local development opt-in ──────────────────────────────────────────────────
+
+test('embed token endpoint: allows localhost when EMBED_ALLOW_LOCALHOST=true in dev', async () => {
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app, restore } = buildAppWithOriginPolicy(originQueryImpl([]), true);
+
+  try {
+    const res = await request(app)
+      .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+      .set('Authorization', `Bearer ${embedToken}`)
+      .set('Origin', 'http://localhost:3000');
+
+    // 404 from missing DB rows is acceptable — 403 would be wrong.
+    assert.notEqual(res.status, 403);
+  } finally {
+    restore();
+  }
+});
+
+test('embed token endpoint: does not allow localhost without the opt-in flag', async () => {
+  const savedOptIn = process.env.EMBED_ALLOW_LOCALHOST;
+  delete process.env.EMBED_ALLOW_LOCALHOST;
+
+  const embedToken = jwt.sign({ sub: CAMPAIGN_ID, origins: [] }, JWT_SECRET);
+  const { app, restore } = buildAppWithOriginPolicy(originQueryImpl([]));
+
+  try {
+    const res = await request(app)
+      .get(`/api/embed/campaigns/${CAMPAIGN_ID}`)
+      .set('Authorization', `Bearer ${embedToken}`)
+      .set('Origin', 'http://localhost:3000');
+
+    assert.equal(res.status, 403);
+  } finally {
+    if (savedOptIn !== undefined) process.env.EMBED_ALLOW_LOCALHOST = savedOptIn;
+    restore();
+  }
 });
